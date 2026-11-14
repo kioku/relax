@@ -2513,6 +2513,36 @@ pub(crate) fn edited_crates() -> Vec<u32> {
     EDITED_CRATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Live watcher rounds that saw a change and have not ended (SaveSeen).
+static SAVES_SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A live watcher round from the change it saw to its end, however it ends: the edit applied,
+/// refused, failed to compile or undone, nothing to do after all, the watcher's end or a panic.
+/// Meanwhile the files on disk may not be the program's (a save held while its tree settles, a
+/// git lock, the edit's read and check), and a settle rebuild's restore, which checks the
+/// crates against them, would take only the crates before the saved one: it waits
+/// (settle_rebuild::not_now). The count goes down to 0 at most (a round that outlives a
+/// reset_statics).
+struct SaveSeen;
+
+impl SaveSeen {
+    fn new() -> SaveSeen {
+        SAVES_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SaveSeen
+    }
+}
+
+impl Drop for SaveSeen {
+    fn drop(&mut self) {
+        let _ = SAVES_SEEN.try_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+}
+
+/// Whether a live watcher round has seen a change it has not applied or dropped yet (SaveSeen).
+pub(crate) fn save_seen() -> bool {
+    SAVES_SEEN.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
+
 /// PROGRAM_EDITS.
 pub(crate) fn program_edits() -> u64 {
     PROGRAM_EDITS.load(std::sync::atomic::Ordering::SeqCst)
@@ -9726,6 +9756,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
             continue;
         }
         let seen = std::time::Instant::now();
+        // from here to the round's end the files on disk may not be the program's (SaveSeen)
+        let _save_seen = SaveSeen::new();
         let mut wait = match settle_wait.take() {
             Some(w) if std::mem::take(&mut again_wait) => w,
             _ => {
@@ -11425,6 +11457,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&EDITED_CRATES, relax_session::sync::Mutex::new(Vec::new()));
     reset(&INCLUDES_EDITED, relax_session::sync::Mutex::new(Vec::new()));
     reset(&PROGRAM_EDITS, std::sync::atomic::AtomicU64::new(0));
+    reset(&SAVES_SEEN, std::sync::atomic::AtomicU32::new(0));
     reset(&RESTART_SUPPORTED, std::sync::atomic::AtomicBool::new(false));
     reset(&LAYOUT_GROUP, std::sync::atomic::AtomicU32::new(0));
     reset(&UNIT_SUSPECT, relax_session::sync::Mutex::new(None));

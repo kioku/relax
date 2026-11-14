@@ -263,6 +263,12 @@ fn not_now() -> Option<String> {
     if RELOADING.load(Ordering::Acquire) > 0 {
         return Some("a reload is in progress".into());
     }
+    // a live save seen and not applied yet (its tree settling, a git lock): the restore checks
+    // the crates against the files on disk and would take only those before the saved one, a
+    // misfit after a costly encode, twice (a live test session held by a git lock, 11-14)
+    if crate::reload::save_seen() {
+        return Some("a save waits to be applied".into());
+    }
     None
 }
 
