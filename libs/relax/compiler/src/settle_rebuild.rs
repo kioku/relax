@@ -515,7 +515,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     let t_open = Instant::now();
     {
         let (opt, tier1, provided) = settings;
-        let from = crate::cache::OpenFrom { prog: &fresh.prog, tcx: &fresh.tcx, opt, tier1, global_allocator: crate::jit::global_allocator_static_of(&fresh.prog, false), provided, anchors: None };
+        let from = crate::cache::OpenFrom { prog: &fresh.prog, tcx: &fresh.tcx, opt, tier1, global_allocator: crate::jit::global_allocator_static_of(&fresh.prog, false), provided, anchors: None, shared: None };
         let mut cache = match crate::cache::Cache::open_from(&from, mode, crate::dirs::relax_dir(), Some(&fresh.collected)) {
             Ok(c) => c,
             Err(e) => return failed(format!("the cache did not open: {e}")),

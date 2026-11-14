@@ -103,6 +103,23 @@ impl Anchors {
         key_of(&self.dirs)
     }
 
+    /// The key of the places no checkout owns (the cargo home, std's folder): what a sealed
+    /// crate's code is keyed by in place of key(), the same in every checkout over them.
+    pub fn machine_key(&self) -> u128 {
+        let mut h = crate::sip::Sip128::new();
+        h.str("relax-sealed-anchors");
+        for (tag, dir) in self.dirs.iter().filter(|(tag, _)| *tag == "cargo") { h.str(tag); h.str(dir); }
+        h.str("std");
+        h.str(&self.std);
+        h.finish128()
+    }
+
+    /// The checkout's folders (the workspace, the run dir), absolute: text a sealed entry never
+    /// holds.
+    pub fn checkout_dirs(&self) -> impl Iterator<Item = &str> {
+        self.dirs.iter().filter(|(tag, _)| matches!(*tag, "ws" | "run")).map(|(_, dir)| dir.as_str())
+    }
+
     /// Whether `path` is a source no checkout owns: under the cargo home or std's folder, and in
     /// no folder of the checkout, the workspace or the run dir (a cargo home inside the workspace
     /// is the checkout's, and so are packages downloaded into the run dir).
