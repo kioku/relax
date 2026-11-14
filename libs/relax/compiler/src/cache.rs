@@ -1131,12 +1131,42 @@ pub struct OpenFrom<'a> {
 }
 
 /// The folder whose code stores a user's checkouts share: per sealed crate (sealed_crates) one
-/// store of the entries made from sealed crates alone, keyed the same in every checkout. `write`:
-/// this run adds to them (a read-only or confined run only reads).
+/// store of the entries made from sealed crates alone, keyed the same in every checkout. A run that
+/// has it reads and writes it (shared_code says which runs have it). `stale`: stores this process
+/// found stale or that refused a batch, neither read nor written (a settle rebuild's new cache
+/// keeps its run's findings).
 #[derive(Clone, Debug)]
 pub struct SharedCode {
     pub dir: PathBuf,
-    pub write: bool,
+    pub stale: Vec<PathBuf>,
+}
+
+/// The shared code stores of a run (None: it has none). Only a run whose third-party compile-time
+/// code is confined (Policy::Sandboxed, `makepad`) has them: a confined registry macro reaches
+/// nothing a key or a ledger does not hold (its tokens, the lexer, the invoking crate's cargo
+/// environment and `[env]`: LATE_CONFIG_ENV). Under Open (bare `relax`) such a macro runs as host
+/// code and may read the process environment or any file, so its code is not a function of its
+/// key, and code made confined is not what it would make: it neither writes nor reads them. None
+/// too under RELAX_CACHE_DIR (`own_cache_dir`: tests and measurement keep every store in their own
+/// folder), and when `home` (the folder, made private: shared_code_root) is refused.
+pub fn shared_code(policy: crate::sandbox::Policy, own_cache_dir: bool, home: impl FnOnce() -> Result<PathBuf, String>) -> Option<SharedCode> {
+    if policy != crate::sandbox::Policy::Sandboxed || own_cache_dir {
+        return None;
+    }
+    home().ok().map(|dir| SharedCode { dir, stale: Vec::new() })
+}
+
+/// The shared code folder this process's caches open (OpenFrom::with): set by the run's entry
+/// (run.rs cmd_run_inner), so a test or a tool that opens a cache shares nothing unless it says so.
+static SHARED_CODE: relax_session::sync::Mutex<Option<SharedCode>> = relax_session::sync::Mutex::new(None);
+
+/// Sets the shared code stores of this process's caches (shared_code; None: none).
+pub fn set_shared_code(s: Option<SharedCode>) {
+    *SHARED_CODE.lock().unwrap_or_else(|e| e.into_inner()) = crate::zone_alloc::kept_with(|| s.clone());
+}
+
+fn process_shared_code() -> Option<SharedCode> {
+    SHARED_CODE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The user's shared code folder: `<relax home>/code` (its stores in `cache/`, their builds' live
@@ -1153,7 +1183,7 @@ impl<'a> OpenFrom<'a> {
     /// new state)
     pub fn with(u: &Unit, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> Self {
         OpenFrom { prog, tcx, opt: u.opt.clone(), tier1: u.tier1.is_some(), global_allocator: crate::jit::global_allocator_static_of(prog, u.aux),
-            provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect(), anchors: None, shared: None }
+            provided: u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect(), anchors: None, shared: process_shared_code() }
     }
 }
 
@@ -1464,7 +1494,10 @@ impl Cache {
             let sdir = sh.dir.join("cache");
             if pack::ensure_private_dir(&sh.dir).is_ok() && pack::ensure_private_dir(&sdir).is_ok() {
                 for ci in (0..ncr).filter(|&ci| c.sealed[ci]) {
-                    c.shared_path[ci] = Some(sdir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.view[ci], c.sealed_key)));
+                    let p = sdir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.view[ci], c.sealed_key));
+                    // found stale, or refusing a batch, by this process before (a settle rebuild's cache)
+                    c.shared_stale[ci] = sh.stale.contains(&p);
+                    c.shared_path[ci] = Some(p);
                 }
             } else {
                 c.shared = None;
@@ -1565,8 +1598,8 @@ impl Cache {
         // this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
             let r = root.clone();
-            // the shared code folder too, when this run writes it (by size alone: prune_shared)
-            let shared = c.shared.as_ref().filter(|s| s.write).map(|s| s.dir.clone());
+            // the shared code folder too (by size alone: prune_shared)
+            let shared = c.shared.as_ref().map(|s| s.dir.clone());
             { let _k = crate::zone_alloc::kept();
             let _ = crate::run_threads::spawn("run-cache-prune", move || { let _z = crate::zone_alloc::compiler_thread();
                 makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
@@ -1625,6 +1658,7 @@ impl Cache {
         let name_of = |id: &str| ident_names.get(id).cloned();
         for (ci, st) in shared_crates.into_iter().zip(shared_opened) {
             let Some(st) = st else { continue };
+            if c.shared_stale[ci] { continue; }
             if !ledger_current_named(&st, &name_of, &mut late) {
                 c.shared_stale[ci] = true;
                 continue;
@@ -1825,10 +1859,22 @@ impl Cache {
     }
 
     /// Whether this run adds entries to crate `c`'s shared code store: one is open for it (a sealed
-    /// crate's), not stale, and the run writes the shared stores.
+    /// crate's), not stale, and the run writes its stores.
     fn shared_writable(&self, c: u32) -> bool {
-        self.mode != Mode::ReadOnly && self.shared.as_ref().is_some_and(|s| s.write)
+        self.mode != Mode::ReadOnly && self.shared.is_some()
             && self.shared_path.get(c as usize).is_some_and(|p| p.is_some()) && self.shared_stale.get(c as usize) == Some(&false)
+    }
+
+    /// The shared code stores as this cache uses them, for a settle rebuild's new cache: the ones it
+    /// found stale or that refused a batch stay so (SharedCode::stale). None: it has none.
+    pub fn shared_for_rebuild(&self) -> Option<SharedCode> {
+        let mut sh = self.shared.clone()?;
+        for (p, stale) in self.shared_path.iter().zip(&self.shared_stale) {
+            if let (Some(p), true) = (p, *stale) {
+                if !sh.stale.contains(p) { sh.stale.push(p.clone()); }
+            }
+        }
+        Some(sh)
     }
 
     /// The pending store of a verdict over code key `key` (a borrowck or tier verdict) whose store
@@ -4801,7 +4847,7 @@ impl Cache {
         if let Some(root) = self.dir.parent() {
             prune_root(root);
         }
-        if let Some(sh) = self.shared.as_ref().filter(|s| s.write) {
+        if let Some(sh) = self.shared.as_ref() {
             prune_shared(&sh.dir);
         }
         Ok(n)
@@ -6050,7 +6096,19 @@ impl Cache {
             }
             return None;
         }
-        self.verify_same_tier(u, id, &cached, fresh, relocs, provisional)
+        // an entry of a shared store was recorded in the sealed key's namespace (its data objects
+        // keyed by the sealed key: data_entry): the fresh encoding is made in the same one
+        let shared_crate = self.index_at(key).filter(|&(p, _)| self.is_shared_store(p)).and_then(|(p, _)| {
+            let path = &self.stores[p as usize].path;
+            self.shared_path.iter().position(|q| q.as_ref() == Some(path))
+        });
+        let outside = (self.cur_crate, self.cur_sealed, self.cur_shared);
+        if let Some(c) = shared_crate {
+            (self.cur_crate, self.cur_sealed, self.cur_shared) = (c as u32, true, true);
+        }
+        let same = self.verify_same_tier(u, id, &cached, fresh, relocs, provisional);
+        (self.cur_crate, self.cur_sealed, self.cur_shared) = outside;
+        same
     }
 
     /// Verify mode: where two encodings of a record's build inputs part (encode_inputs): the
@@ -9016,6 +9074,124 @@ mod data_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Only a run whose third-party compile-time code is confined (Policy::Sandboxed) has the
+    /// shared code stores (shared_code), and it reads and writes them; an Open run, or one with its
+    /// own cache dir, has none. Checkouts a (Open), b and c (Sandboxed) of one program over one cargo
+    /// home, sealed registry crate dep, whose confined macro read `[env]` K (sip LATE_CONFIG_ENV):
+    /// an Open run neither writes nor links shared code, a Sandboxed run writes dep's entries and
+    /// another checkout links them (a verify finds them the same: the constant their code names is
+    /// keyed by the sealed key on both sides), K is checked by value (a mismatch or K absent neither
+    /// uses nor changes the shared store), and K in the process environment is not an input.
+    #[test]
+    fn only_runs_with_confined_compile_time_code_use_the_shared_stores() {
+        isolated_test!(only_runs_with_confined_compile_time_code_use_the_shared_stores);
+        use crate::sandbox::Policy;
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let top = std::env::temp_dir().join(format!("relax-confined-shared-{}", std::process::id()));
+        let (cargo, std_dir, home) = (top.join("cargo"), top.join("std"), top.join("home/code"));
+        let registry = cargo.join("registry/src/index");
+        let write = |path: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write(&registry.join("dep-1.0.0/src/lib.rs"), "#![no_std] pub fn twice(x: u32) -> u32 { x * 2 } pub fn three() -> u32 { 3 }");
+        let (a, b, c) = (top.join("a"), top.join("b"), top.join("c"));
+        for ws in [&a, &b, &c] {
+            write(&ws.join("src/lib.rs"), "#![no_std] pub fn main() -> u32 { dep::twice(1) + dep::three() }");
+        }
+        let shared = |policy: Policy, own_dir: bool| shared_code(policy, own_dir, || Ok(home.clone()));
+        assert!(shared(Policy::Open, false).is_none() && shared(Policy::Sandboxed, false).map(|s| s.dir) == Some(home.clone()) && shared(Policy::Sandboxed, true).is_none(),
+            "an Open run and a run with its own cache dir have no shared store");
+        // slots dep::twice, dep::three, app::main
+        let load = |ws: &std::path::Path| {
+            let mut prog = crate::program::Program::new(&session);
+            let d = prog.load_crate("dep", registry.join("dep-1.0.0/src/lib.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+            let deps = vec![(prog.syms.intern("dep"), d)];
+            prog.load_crate("app", ws.join("src/lib.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), deps).unwrap();
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            let u = Unit::new(prog, tcx, 0);
+            let def = |krate: &str, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&x| u.prog.syms.str(u.prog.crates[u.prog.def(x).krate as usize].name) == krate && u.prog.name(x) == name).unwrap();
+            let ids = [("dep", "twice"), ("dep", "three"), ("app", "main")].map(|(k, n)| u.fn_id(FnKey::Inst(def(k, n), vec![])));
+            // a constant each slot's code names (a data object: keyed by the sealed key in a shared store)
+            let k = u.data(b"a constant", 1, DataKind::Bytes);
+            let k = u.data_sym(k);
+            (u, ids, k)
+        };
+        // every unit made before any runs (a unit's drop stops the key queries of later ones)
+        let (mut ua, a_ids, a_k) = load(&a);
+        let (mut ub, b_ids, b_k) = load(&b);
+        let (mut uc, c_ids, c_k) = load(&c);
+        const CODE: [u8; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0xc3];
+        let named = |k: Sym| [RelocAt { at: 0, kind: RelocKind::Pool64, target: Reloc::Sym(k) }];
+        const K: &str = "RELAX_SHARED_CONFIG_ENV_TEST_K";
+        // checkout `ws`'s cache under `policy`, dep's macro having read `[env]` K = `config`
+        let open = |u: &Unit, ws: &std::path::Path, policy: Policy, config: Option<&str>| -> Cache {
+            // Safety: no other thread of this test reads or notes late inputs
+            unsafe { relax_session::reset_statics() };
+            crate::sandbox::set_policy(policy);
+            crate::crates::set_config_env(config.map(|v| (K.to_string(), v.to_string())).into_iter().collect());
+            let call = crate::macro_reg::with_call_krate("dep");
+            assert_eq!(crate::macro_reg::call_krate_env(K).as_deref(), config, "dep's macro reads [env]'s value");
+            drop(call);
+            let mut from = OpenFrom::of(u);
+            from.anchors = Some(crate::dirs::Anchors::of(&[
+                ("run", ws.join("target/relax").to_str().unwrap()), ("cargo", cargo.to_str().unwrap()), ("ws", ws.to_str().unwrap()),
+            ], std_dir.to_str().unwrap()));
+            from.shared = shared(policy, false);
+            let mut cache = Cache::open_from(&from, Mode::ReadOnly, ws.join("target/relax"), None).unwrap();
+            cache.mode = Mode::On;
+            cache
+        };
+        // one run: which slots hit (a miss is recorded, its code naming constant `k`) and
+        // [recorded, sealed records, shared records, shared hits]
+        let run = |u: &mut Unit, ids: &[u32; 3], k: Sym, ws: &std::path::Path, policy: Policy, config: Option<&str>| -> ([bool; 3], [u64; 4]) {
+            let mut cache = open(u, ws, policy, config);
+            let hit = ids.map(|id| cache.lookup(u, id).is_some());
+            for (&id, hit) in ids.iter().zip(hit) {
+                if !hit { cache.record(u, id, &CODE, &named(k), &[]); }
+            }
+            cache.flush().unwrap();
+            let st = &cache.stats;
+            (hit, [st.recorded, st.sealed_records, st.shared_records, st.shared_hits])
+        };
+        // the shared stores and their bytes (their builds' live locks aside)
+        let stores = || -> Vec<(std::path::PathBuf, Vec<u8>)> {
+            let mut v: Vec<_> = std::fs::read_dir(home.join("cache")).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file())
+                .map(|p| { let bytes = std::fs::read(&p).unwrap(); (p, bytes) }).collect();
+            v.sort();
+            v
+        };
+        let one = Some("one");
+        let opened = run(&mut ua, &a_ids, a_k, &a, Policy::Open, one);
+        assert!(opened == ([false; 3], [3, 2, 0, 0]) && stores().is_empty(), "an Open run writes nothing shared: {opened:?}");
+        let wrote = run(&mut ub, &b_ids, b_k, &b, Policy::Sandboxed, one);
+        assert!(wrote == ([false; 3], [3, 2, 2, 0]) && !stores().is_empty(), "a Sandboxed run writes its sealed entries: {wrote:?}");
+        assert_eq!(run(&mut ua, &a_ids, a_k, &a, Policy::Open, one), ([true; 3], [0, 0, 0, 0]), "an Open run links nothing shared");
+        assert_eq!(run(&mut uc, &c_ids, c_k, &c, Policy::Sandboxed, one), ([true, true, false], [1, 0, 0, 2]), "a second Sandboxed checkout links them");
+        // (a verify of them compares in their store's namespace: their constant is keyed alike)
+        let mut cache = open(&uc, &c, Policy::Sandboxed, one);
+        let verified: Vec<_> = c_ids[..2].iter().map(|&id| (cache.lookup(&mut uc, id).is_some(), cache.verify_entry(&uc, id, &CODE, &named(c_k)))).collect();
+        assert_eq!(verified, [(true, Some(true)); 2], "a second Sandboxed checkout links them, and a verify finds them the same");
+        drop(cache);
+        let before = stores();
+        for other in [Some("two"), None] {
+            let (hit, st) = run(&mut uc, &c_ids, c_k, &c, Policy::Sandboxed, other);
+            assert!(hit[..2] == [false, false] && st[1..] == [2, 0, 0] && stores() == before,
+                "an `[env]` value a confined macro read is checked by value; a mismatch neither uses nor changes the shared store ({other:?}: {hit:?} {st:?})");
+        }
+        assert_eq!(run(&mut ub, &b_ids, b_k, &b, Policy::Sandboxed, one), ([true; 3], [0, 0, 0, 2]),
+            "an `[env]` value a confined macro read is checked by value; a mismatch neither uses nor changes the shared store (b with K=one still hits)");
+        // (this test's process is this test alone: isolated_test)
+        std::env::set_var(K, "from the shell");
+        assert_eq!(run(&mut ub, &b_ids, b_k, &b, Policy::Sandboxed, one), ([true; 3], [0, 0, 0, 2]), "the process environment is not an input of a confined macro");
+        drop((ua, ub, uc));
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
     /// Two checkouts `a` and `b` of one program over one cargo home, each with its own run dir,
     /// opened with their own anchors (OpenFrom::anchors) in the order a, b, b edited, b, a. Which
     /// crates are sealed (no checkout owns their code): a registry package; not one with a build
@@ -9095,7 +9271,7 @@ mod data_tests {
         let open = |u: &Unit, ws: &std::path::Path, dir: &str, shared: Option<&std::path::Path>, std_dir: &std::path::Path| {
             let mut from = OpenFrom::of(u);
             from.anchors = Some(anchors(ws, &cargo, std_dir));
-            from.shared = shared.map(|dir| SharedCode { dir: dir.to_path_buf(), write: true });
+            from.shared = shared.map(|dir| SharedCode { dir: dir.to_path_buf(), stale: Vec::new() });
             let mut cache = Cache::open_from(&from, Mode::ReadOnly, ws.join(dir), None).unwrap();
             cache.mode = Mode::On;
             cache
@@ -9262,7 +9438,7 @@ mod data_tests {
             from.anchors = Some(crate::dirs::Anchors::of(&[
                 ("run", ws.join(dir).to_str().unwrap()), ("cargo", cargo.to_str().unwrap()), ("ws", ws.to_str().unwrap()),
             ], std_dir.to_str().unwrap()));
-            from.shared = Some(SharedCode { dir: shared.to_path_buf(), write: true });
+            from.shared = Some(SharedCode { dir: shared.to_path_buf(), stale: Vec::new() });
             let mut cache = Cache::open_from(&from, Mode::ReadOnly, ws.join(dir), None).unwrap();
             cache.mode = Mode::On;
             cache

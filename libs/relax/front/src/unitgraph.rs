@@ -1375,8 +1375,8 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
 /// A confined script's folders (Q2's roots): (what it reads, what it never reaches). It reads its
 /// package's source: a registry package's folder, a git package's repository (its store mount; a
 /// checkout on disk: the package's folder), a path package's workspace. It never reaches the
-/// run's folder (`run_dir`), the workspace's target folder or Relax's dir, however it spells
-/// them. OUT_DIR, which it writes, is its environment's (a shared workspace's moves after this).
+/// run's folder (`run_dir`), the workspace's target folder, Relax's dir or the code a user's
+/// checkouts share (`<relax home>/code`), however it spells them. OUT_DIR, which it writes, is its environment's (a shared workspace's moves after this).
 /// A store's or a folder mount's path stays as this run names it: the script's run maps it
 /// (relax-compiler sandbox/script.rs `roots_of`), so the checkouts of a shared workspace keep one
 /// units file.
@@ -1386,7 +1386,7 @@ fn script_folders(pkg_dir: &str, script: Option<&RawUnit>, run_dir: &str) -> (Ve
         Some(u) if u.registry => pkg_dir.to_string(),
         _ => crate::resolve::find_root(pkg_dir).unwrap_or_else(|_| pkg_dir.to_string()),
     };
-    let mut excluded = vec![run_dir.to_string(), crate::dirs::relax_dir().display().to_string()];
+    let mut excluded = vec![run_dir.to_string(), crate::dirs::relax_dir().display().to_string(), crate::gitstore::relax_home().join("code").display().to_string()];
     if let Ok(t) = crate::resolve::target_dir(pkg_dir) {
         excluded.push(t);
     }

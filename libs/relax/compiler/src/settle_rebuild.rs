@@ -536,7 +536,9 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     let (spill, settings) = steps.owner("the rest flushed and taken on the owner", || unsafe {
         let u = &mut *up;
         u.flush_cache_records();
-        (u.cache.as_mut().and_then(|c| c.spill_take()), (u.opt.clone(), u.tier1.is_some(), u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect::<Vec<_>>()))
+        // (the shared code stores as the run's cache uses them: its stale ones stay stale)
+        let shared = u.cache.as_ref().and_then(|c| c.shared_for_rebuild());
+        (u.cache.as_mut().and_then(|c| c.spill_take()), (u.opt.clone(), u.tier1.is_some(), u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect::<Vec<_>>(), shared))
     });
     if let Some(s) = spill {
         if let Err(e) = steps.time("spill written", || s.write()) { return failed(format!("the cache spill failed: {e}")); }
@@ -544,8 +546,8 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     let mut fresh = fresh;
     let t_open = Instant::now();
     {
-        let (opt, tier1, provided) = settings;
-        let from = crate::cache::OpenFrom { prog: &fresh.prog, tcx: &fresh.tcx, opt, tier1, global_allocator: crate::jit::global_allocator_static_of(&fresh.prog, false), provided, anchors: None, shared: None };
+        let (opt, tier1, provided, shared) = settings;
+        let from = crate::cache::OpenFrom { prog: &fresh.prog, tcx: &fresh.tcx, opt, tier1, global_allocator: crate::jit::global_allocator_static_of(&fresh.prog, false), provided, anchors: None, shared };
         let mut cache = match crate::cache::Cache::open_from(&from, mode, crate::dirs::relax_dir(), Some(&fresh.collected)) {
             Ok(c) => c,
             Err(e) => return failed(format!("the cache did not open: {e}")),

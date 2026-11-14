@@ -962,6 +962,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     ERRORS_SEEN.store(0, Ordering::Relaxed);
     crate::clock::mark_process_start();
     jit::begin_startup_phase();
+    // the code a user's checkouts share (Target B, cache.rs shared_code)
+    crate::cache::set_shared_code(crate::cache::shared_code(crate::sandbox::policy(), crate::dirs::override_dir().is_some(), || {
+        let dir = crate::cache::shared_code_root();
+        let made = crate::pack::ensure_private_dir(&dir).and_then(|_| crate::pack::ensure_private_dir(&dir.join("cache")));
+        if let Err(e) = &made {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("relax: the shared code folder {} is refused ({e}): this run shares no code with other checkouts", dir.display());
+            }
+        }
+        made.map(|_| dir)
+    }));
     let mut driver_options = sess.options.clone();
     crate::registry_net::install();
     crate::pmhost::install();
