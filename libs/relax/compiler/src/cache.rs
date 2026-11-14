@@ -8403,8 +8403,12 @@ mod data_tests {
         let ids = [u.fn_id(FnKey::Inst(name, vec![t])), u.fn_id(FnKey::Inst(r_own, vec![])), u.fn_id(FnKey::Inst(s_own, vec![]))];
         // one run over the cache with GAP_X = `value`, as `s`'s expansion of env! notes it: whether
         // each slot hit (a miss is recorded), and how many records went to a store wider than
-        // their deepest crate's
+        // their deepest crate's. Each starts with sip's late inputs as a fresh process has them
+        // (run_end): one run's GAP_X is not a live edit of the run before's (sip::late_moved, whose
+        // stores are not written).
         let mut run = |value: &str| -> ([bool; 3], u64) {
+            // Safety: no other thread of this test reads or notes late inputs
+            unsafe { relax_session::reset_statics() };
             crate::crates::set_crate_env("s", vec![("GAP_X".to_string(), value.to_string())]);
             crate::sip::note_late_input("s", crate::sip::LATE_ENV, "GAP_X", Some(value.as_bytes()));
             let mut cache = open_test_cache(&u, &dir.join("cache"));
