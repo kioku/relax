@@ -203,13 +203,58 @@ pub fn launch_link(_loader: &Path, _name: &str) -> Option<PathBuf> {
     None
 }
 
+/// What tells a file from another, and the file from what replaced it at its path: its volume and
+/// its number there (Unix: device and inode; Windows: volume serial and file index), its length and
+/// its last write.
+struct FileId {
+    volume: u64,
+    index: u64,
+    len: u64,
+    written: u128,
+}
+
 #[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
+fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+    let m = std::fs::metadata(path).ok()?;
+    let written = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    Some(FileId { volume: m.dev(), index: m.ino(), len: m.len(), written })
+}
+
+#[cfg(windows)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use makepad_windows_sys::Win32::Foundation::HANDLE;
+    use makepad_windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    // its attributes only: no read of the file, which a running image allows as any file does
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path).ok()?;
+    let mut i = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(f.as_raw_handle()), &mut i) }.ok()?;
+    let (w, high) = (i.ftLastWriteTime, |h: u32, l: u32| (h as u64) << 32 | l as u64);
+    Some(FileId {
+        volume: i.dwVolumeSerialNumber as u64,
+        index: high(i.nFileIndexHigh, i.nFileIndexLow),
+        len: high(i.nFileSizeHigh, i.nFileSizeLow),
+        written: high(w.dwHighDateTime, w.dwLowDateTime) as u128,
+    })
+}
+
+/// Whether `a` and `b` are one file: a hard link and the file it was made of are, a copy is not.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (file_id(a), file_id(b)) {
+        (Some(a), Some(b)) => a.volume == b.volume && a.index == b.index,
         _ => false,
     }
+}
+
+/// The name of the links' folder of the loader file at `loader`: its volume, number, length and
+/// last write, so a loader that replaced it (a new build) has another. Only a name: whether a link
+/// in it is that loader's file `same_file` says.
+pub fn loader_key(loader: &Path) -> Option<String> {
+    let f = file_id(loader)?;
+    Some(format!("{:x}-{:x}-{:x}-{:x}", f.volume, f.index, f.len, f.written))
 }
 
 /// What a restart in place execs: `loader` by the run's launch link, so the process keeps its
@@ -581,16 +626,96 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-// (Linux: /dev/shm is a volume of its own a test can write to; the Mac and the Windows node have
-// none: macOS shows its system and data volumes as one device, and the Windows node has only C:)
-#[cfg(all(test, target_os = "linux"))]
+/// The parent of the process `pid`, None when it is gone or not ours to see.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn parent_of(pid: u32) -> Option<u32> {
+    // `pid (name) state ppid ...`: the name may hold spaces and parentheses, so after its last `)`
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat[stat.rfind(')')? + 1..].split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_vendor = "apple")]
+pub fn parent_of(pid: u32) -> Option<u32> {
+    extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, size: i32) -> i32;
+    }
+    // struct proc_bsdshortinfo (64 bytes): pbsi_pid, then pbsi_ppid
+    const PROC_PIDT_SHORTBSDINFO: i32 = 13;
+    let mut buf = [0u8; 64];
+    let n = unsafe { proc_pidinfo(i32::try_from(pid).ok()?, PROC_PIDT_SHORTBSDINFO, 0, buf.as_mut_ptr(), buf.len() as i32) };
+    let word = |at: usize| u32::from_ne_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    (n == buf.len() as i32 && word(0) == pid).then(|| word(4))
+}
+
+#[cfg(windows)]
+pub fn parent_of(pid: u32) -> Option<u32> {
+    use makepad_windows_sys::Win32::Foundation::CloseHandle;
+    use makepad_windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).ok()?;
+        let mut e = PROCESSENTRY32W::default();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut parent = None;
+        let mut more = Process32FirstW(snap, &mut e).is_ok();
+        while more && parent.is_none() {
+            if e.th32ProcessID == pid {
+                parent = Some(e.th32ParentProcessID);
+            }
+            more = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+        parent
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple", windows)))]
+pub fn parent_of(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    /// What the links of a loader are told by: a hard link and its file are one file, with one
+    /// key; a copy is another file; the file a new build put at the loader's path has another key
+    /// and is no longer the link's; a child's parent is this process.
+    #[test]
+    fn a_link_is_its_file_and_a_child_names_its_parent() {
+        let dir = std::env::temp_dir().join(format!("relax-same-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, link, copy, new) = (dir.join("loader"), dir.join("link"), dir.join("copy"), dir.join("new"));
+        std::fs::write(&file, b"the loader").unwrap();
+        std::fs::hard_link(&file, &link).unwrap();
+        std::fs::copy(&file, &copy).unwrap();
+        let key = loader_key(&file);
+        let linked = (same_file(&file, &link), loader_key(&link) == key, same_file(&file, &copy));
+        // as cargo replaces a binary: a new file renamed over it
+        std::fs::write(&new, b"the loader").unwrap();
+        std::fs::rename(&new, &file).unwrap();
+        let replaced = (loader_key(&file) != key, same_file(&file, &link));
+        // a child that waits for the end of its input
+        let waits = if cfg!(windows) { Path::new(&std::env::var_os("SystemRoot").unwrap_or_default()).join("System32").join("sort.exe") } else { PathBuf::from("cat") };
+        let mut child = std::process::Command::new(&waits).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let parent = parent_of(child.id());
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(key.is_some(), "the loader has a key");
+        assert_eq!(linked, (true, true, false), "a hard link is its file and has its key; a copy is another file");
+        assert_eq!(replaced, (true, false), "the file that replaced the loader has another key and is not the link's");
+        assert_eq!(parent, Some(std::process::id()), "the parent of a child of this process");
+    }
+
+    // (Linux: /dev/shm is a volume of its own a test can write to; the Mac and the Windows node
+    // have none: macOS shows its system and data volumes as one device, and the Windows node has
+    // only C:)
     /// A loader on another volume than the run dir: each link is a hard link of one copy of it on
     /// the run dir's volume, made once (relax issue 163: on Windows the hard link failed with os
     /// error 17 and the run had no executable of its own). The two volumes: a file of ours in the
     /// temp folder and /dev/shm (a tmpfs of its own).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_loader_on_another_volume_is_linked_from_one_copy() {
         use std::os::unix::fs::MetadataExt;
