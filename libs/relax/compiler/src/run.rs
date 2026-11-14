@@ -1333,7 +1333,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 2;
     }
     let own = (!check && !embedded).then(|| std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| e.to_string()).and_then(|exe| {
-        crate::selfexe::link(&exe, &crate::selfexe::program_name(&cargo_flags, &package), harness || plain_test)
+        // a test's links' folder is its launchers' words' (selfexe test_key: unitgraph.rs writes them)
+        let test = (harness || plain_test).then(|| {
+            let (profile, allow_c, ws) = (unitgraph::test_profile().unwrap_or(""), std::env::var("RELAX_ALLOW_C").unwrap_or_default(), workspace_dir());
+            let words: Vec<&str> = [package.as_str(), profile, allow_c.as_str(), ws.as_str()].into_iter().chain(cargo_flags.iter().map(String::as_str)).collect();
+            crate::selfexe::test_key(&words)
+        });
+        crate::selfexe::link(&exe, &crate::selfexe::program_name(&cargo_flags, &package), test.as_deref())
     }));
     if let Some(Err(why)) = &own {
         eprintln!("relax run: the program's own executable could not be made ({why}): a spawn of it runs the loader, not the program");

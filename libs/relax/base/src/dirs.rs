@@ -169,24 +169,24 @@ pub fn loader_exe() -> std::io::Result<PathBuf> {
 }
 
 /// The files beside a run's own executable (relax-compiler selfexe.rs): names no link has (a link
-/// keeps a name's letters, digits, `-`, `_` and `.`). The run's command line (RELAX_SELF_EXEC's
-/// words), where a launch of the link by a shell finds the run's build environment (progenv
-/// `build_wire`; on Unix the descriptor of a file without a name, never the environment itself),
-/// the loader the link was made of, the folder of the links a process starts runs from, and on
-/// Windows the command lines of a test's package binaries.
-pub const RUN_LINE: &str = "+self-exec";
-pub const RUN_BUILD: &str = "+build";
+/// keeps a name's letters, digits, `-`, `_` and `.`). The folder of the runs of the links there
+/// (`+run/<pid>`: each run's command line, RELAX_SELF_EXEC's words, and where a launch of the link
+/// by a shell finds its build environment, progenv `build_wire`; on Unix the descriptor of a file
+/// without a name, never the environment itself), the loader the links were made of, the folder
+/// of the links a process starts runs from, and on Windows the command lines of a test's package
+/// binaries.
+pub const RUN_ENTRIES: &str = "+run";
 pub const RUN_LOADER: &str = "+loader";
 pub const LAUNCH_DIR: &str = "+launch";
 pub const BIN_LINES: &str = "+bin";
 
-/// Whether `exe` is a run's own executable (its command line beside it), a link a run was
-/// started from (in a `+launch` folder), or a package binary above a test's `deps/` (its line in
-/// `+bin`): none is the loader's own path. A launch of a run's link runs that run's program, as
-/// one of a package binary runs that binary; a launch link goes with its folder.
+/// Whether `exe` is a run's own executable (its runs' folder beside it), a link a run was started
+/// from (in a `+launch` folder), or a package binary above a test's `deps/` (its line in `+bin`):
+/// none is the loader's own path. A launch of a run's link runs that run's program, as one of a
+/// package binary runs that binary.
 pub fn is_run_link(exe: &std::path::Path) -> bool {
     exe.parent().is_some_and(|d| {
-        d.join(RUN_LINE).is_file() || d.file_name().is_some_and(|n| n == LAUNCH_DIR) || exe.file_name().is_some_and(|f| d.join(BIN_LINES).join(f).is_file())
+        d.join(RUN_ENTRIES).is_dir() || d.file_name().is_some_and(|n| n == LAUNCH_DIR) || exe.file_name().is_some_and(|f| d.join(BIN_LINES).join(f).is_file())
     })
 }
 
@@ -291,27 +291,27 @@ mod tests {
         assert_eq!(super::anchor_in("C:/a/ws/f.rs", &[("ws", "C:/a/ws".to_string())]).as_deref(), Some("\0ws\0f.rs"));
     }
 
-    /// A run's link (its line beside it) and a launch link are no loader; each names the loader it
-    /// was made of, and a record that names a run's link is none.
+    /// A run's link (its runs' folder beside it) and a launch link are no loader; each names the
+    /// loader it was made of, and a record that names a run's link is none.
     #[test]
     fn a_runs_link_names_the_loader_it_was_made_of() {
-        use super::{is_run_link, recorded_loader, LAUNCH_DIR, RUN_LINE, RUN_LOADER};
+        use super::{is_run_link, recorded_loader, LAUNCH_DIR, RUN_ENTRIES, RUN_LOADER};
         let root = std::env::temp_dir().join(format!("relax-run-link-{}", std::process::id()));
         let file = |p: &std::path::Path, text: &[u8]| {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, text).unwrap();
         };
         let loader = root.join("bin/relax");
-        let (run, again, launch) = (root.join("exe/1/app"), root.join("exe/2/app"), root.join(LAUNCH_DIR).join("app"));
+        let (run, again, launch) = (root.join("exe/k1/run/app"), root.join("exe/k2/run/app"), root.join("exe/k1").join(LAUNCH_DIR).join("app"));
         file(&loader, b"");
         for link in [&run, &again, &launch] {
             file(link, b"");
         }
-        file(&root.join("exe/1").join(RUN_LINE), b"");
-        file(&root.join("exe/2").join(RUN_LINE), b"");
-        file(&root.join("exe/1").join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
-        file(&root.join(LAUNCH_DIR).join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
-        file(&root.join("exe/2").join(RUN_LOADER), run.as_os_str().as_encoded_bytes());
+        std::fs::create_dir_all(root.join("exe/k1/run").join(RUN_ENTRIES)).unwrap();
+        std::fs::create_dir_all(root.join("exe/k2/run").join(RUN_ENTRIES)).unwrap();
+        file(&root.join("exe/k1/run").join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
+        file(&root.join("exe/k1").join(LAUNCH_DIR).join(RUN_LOADER), loader.as_os_str().as_encoded_bytes());
+        file(&root.join("exe/k2/run").join(RUN_LOADER), run.as_os_str().as_encoded_bytes());
         let got = [is_run_link(&loader), is_run_link(&run), is_run_link(&launch)];
         let recorded = [recorded_loader(&run), recorded_loader(&launch), recorded_loader(&again), recorded_loader(&loader)];
         let _ = std::fs::remove_dir_all(&root);
