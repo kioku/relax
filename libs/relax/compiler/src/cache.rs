@@ -847,6 +847,9 @@ pub struct Cache {
     front_stores_n: usize,
     /// while a key is encoded: the definitions it names (their local bodies join the key)
     enc_defs: Option<Vec<DefId>>,
+    /// while a code key is encoded: the items whose closures its types name (their bodies join
+    /// the key: enc_ty_tree's closure case)
+    enc_closure_items: Option<Vec<DefId>>,
     /// crate identity hash -> crate index
     crate_by_ident: HashMap<u128, u32>,
     crate_ident: Vec<u128>,
@@ -1230,6 +1233,7 @@ impl Cache {
             front_stores_of: Vec::new(),
             front_stores_n: 0,
             enc_defs: None,
+            enc_closure_items: None,
             crate_by_ident,
             crate_ident,
             cfg: cfgh.finish128(),
@@ -2134,6 +2138,15 @@ impl Cache {
                 // its owner's closure ordinal (closure_ordinal): the owner's type first, which
                 // names the item the ordinal counts in
                 let def = match u.tcx.tys.kind(owner) { TyKind::FnDef(d, ..) => Some(*d), _ => None };
+                // The type names the captured places (`s.a`, `s.b`), but the closure's environment
+                // is laid out from its owner's type check: whole captured locals (root-slot
+                // storage, layout::ClosureStorage), a struct the places are fields of. Code over
+                // the type (Box::new::<C>, C's drop glue and shims, a wrapper closure holding it)
+                // bakes that layout in: code_key_bytes hashes the owner's body for it.
+                if let (Some(d), Some(v)) = (def, self.enc_closure_items.as_mut()) {
+                    let item = closure_item(u, d);
+                    if !v.contains(&item) { v.push(item); }
+                }
                 if let Some((ord, fp)) = def.filter(|_| !u.prog.is_edit_version(file)).and_then(|d| self.closure_ordinal(u, d, file, expr)) {
                     e.u8(if coroutine { 30 } else { 28 });
                     crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
@@ -2776,6 +2789,7 @@ impl Cache {
         let mut e = E::default();
         let mut crates = Vec::new();
         let outer = self.enc_defs.replace(Vec::new());
+        let outer_items = self.enc_closure_items.replace(Vec::new());
         let r = self.enc_fnkey(u, key, &mut e, &mut crates, 0);
         // the allocator shim's callers call the program's #[global_allocator] (or the default):
         // their code depends on it, which the fn's own identity does not show
@@ -2791,6 +2805,7 @@ impl Cache {
             }
         }
         let named = std::mem::replace(&mut self.enc_defs, outer).unwrap_or_default();
+        let closure_items = std::mem::replace(&mut self.enc_closure_items, outer_items).unwrap_or_default();
         r?;
         // code of (or instantiated with) a crate loaded after the cache opened: never cached
         if crates.iter().any(|&c| c as usize >= self.crate_ident.len()) {
@@ -2855,8 +2870,14 @@ impl Cache {
                     }
                 }
                 // the bodies the code is made from: the definition's, a closure's enclosing fns'
-                // -- their text and position, and what the names in them find
-                for &d in &kd {
+                // -- their text and position, and what the names in them find -- and the items
+                // whose closures its types name: their type check lays out those closures'
+                // environments (enc_ty_tree), which the code holds as they were
+                let mut bodies = kd.clone();
+                for d in closure_items {
+                    if !bodies.contains(&d) { bodies.push(d); }
+                }
+                for &d in &bodies {
                     h.u128(self.def_body(u, d));
                     h.u128(self.body_names_of(u, d, &g));
                 }
@@ -2868,7 +2889,7 @@ impl Cache {
                 let mut h = Sip128::new();
                 h.str("code-exp");
                 h.u128(k0);
-                for &d in &kd {
+                for &d in &bodies {
                     match self.exp_closure(u, d, k0, dom, &g) {
                         Some(x) => h.u128(x),
                         None => {
