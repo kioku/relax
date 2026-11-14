@@ -5,6 +5,7 @@
 //!   makepad parse <units.json> [threads]   parse the crate graph, time it, write the census
 //!   makepad file <path> [edition]          parse one file, report errors
 //!   makepad clean [-p <package>]           remove the workspace's <target>/relax (or one app's files)
+//!   makepad clean --shared-code            remove the shared code stores of builds not running
 //!   makepad run [opts] <package> [cargo flags] [-- args]   boot a cargo package from source (run.rs)
 
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
@@ -610,7 +611,8 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             os::proc::exit(run::cmd_run(sess, &a));
         }
         "serve" => os::proc::exit(serve_rpc::cmd_serve(sess, &args[2..])),
-        // `makepad clean [-p <package>]`: remove the workspace's <target>/relax (clean.rs)
+        // `makepad clean [-p <package> | --shared-code]`: remove the workspace's <target>/relax, or
+        // the shared code stores (clean.rs)
         "clean" => std::process::exit(clean::cmd_clean(&args[2..])),
         "schema" | "hover" | "definition" => os::proc::exit(serve_rpc::query(sess, &args[1], &args[2..])),
         // `makepad fix --to-strict [--units u.json] <package>`: check in relaxed mode (all features

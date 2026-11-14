@@ -1139,6 +1139,12 @@ pub struct SharedCode {
     pub write: bool,
 }
 
+/// The user's shared code folder: `<relax home>/code` (its stores in `cache/`, their builds' live
+/// locks in `cache/live/`).
+pub fn shared_code_root() -> PathBuf {
+    crate::gitstore::relax_home().join("code")
+}
+
 impl<'a> OpenFrom<'a> {
     pub fn of(u: &'a Unit) -> Self {
         Self::with(u, &u.prog, &u.tcx)
@@ -1555,12 +1561,20 @@ impl Cache {
         // this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
             let r = root.clone();
+            // the shared code folder too, when this run writes it (by size alone: prune_shared)
+            let shared = c.shared.as_ref().filter(|s| s.write).map(|s| s.dir.clone());
             { let _k = crate::zone_alloc::kept();
             let _ = crate::run_threads::spawn("run-cache-prune", move || { let _z = crate::zone_alloc::compiler_thread();
                 makepad_cpu_budget::set_thread_class(makepad_cpu_budget::BACKGROUND);
                 let (b, a) = prune_root(&r);
                 if verbose && std::env::var_os("RELAX_CACHE_TRACE").is_some() && b != a {
                     eprintln!("relax cache: pruned {} -> {} MB", b >> 20, a >> 20);
+                }
+                if let Some(d) = shared {
+                    let (b, a) = prune_shared(&d);
+                    if verbose && std::env::var_os("RELAX_CACHE_TRACE").is_some() && b != a {
+                        eprintln!("relax cache: pruned the shared code folder {} -> {} MB", b >> 20, a >> 20);
+                    }
                 }
             });
             }
@@ -4783,6 +4797,9 @@ impl Cache {
         if let Some(root) = self.dir.parent() {
             prune_root(root);
         }
+        if let Some(sh) = self.shared.as_ref().filter(|s| s.write) {
+            prune_shared(&sh.dir);
+        }
         Ok(n)
     }
 }
@@ -5555,8 +5572,7 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// slot's last build uses stays (native.rs prune). So are the outputs of the build scripts Relax
 /// runs (`<root>/build`): what a script pass's last run used stays (unitgraph.rs prune_build).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
-    let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
-    let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cap);
+    let sizes = prune(root, &crate::store::live(), &crate::store::open_files(), &crate::store::programs(), cache_max());
     let since = std::time::SystemTime::now().checked_sub(IN_USE_BY_OTHERS).unwrap_or(std::time::UNIX_EPOCH);
     let native = crate::native::prune(&root.join("native"), since, false);
     if native > 0 && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
@@ -5567,6 +5583,29 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
         eprintln!("relax cache: pruned {build} build script director(ies) no root names");
     }
     sizes
+}
+
+/// RELAX_CACHE_MAX in bytes (None: unset, the default cap).
+fn cache_max() -> Option<u64> {
+    std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20)
+}
+
+/// Keeps a shared code folder (SharedCode, Target B) by size alone: prune with no programs, so no
+/// store sets and no retiring list there (a program's set is named by the program's identity, the
+/// same in two checkouts of one app: one checkout's set would retire the stores of the other's
+/// views), and the cap on this folder alone (RELAX_CACHE_MAX, else twice this run's stores there,
+/// at least CAP_FLOOR_MB). Replaced generations go; then whole stores, least recently used first,
+/// never one this process uses, one another run stamped in the last IN_USE_BY_OTHERS or one of a
+/// running build (its live lock in the folder). An evicted entry is compiled again: a miss, never a
+/// failure. Returns (bytes before, after).
+pub fn prune_shared(root: &std::path::Path) -> (u64, u64) {
+    prune_shared_with(root, &crate::store::live(), &crate::store::open_files(), cache_max())
+}
+
+/// prune_shared with this run's stores `live`, the generation files it opened `open` and the cap
+/// in bytes (None: the default).
+fn prune_shared_with(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf>, cap: Option<u64>) -> (u64, u64) {
+    prune(root, live, open, &[], cap)
 }
 
 /// At exit: every store's replaced generations go, including the ones this process itself
@@ -9037,6 +9076,16 @@ mod data_tests {
         std::fs::remove_dir_all(&a2).unwrap();
         std::fs::rename(&a, &a2).unwrap();
         assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), (first, [6, 0, 0, 1, 1]), "the moved checkout links only the shared code");
+        // the shared folder's cap evicts the store (not stamped lately, used by no run of this
+        // process now): the next run compiles that code again and shares it, a miss and no failure
+        let shared_dir = top.join("home/code");
+        for e in std::fs::read_dir(shared_dir.join("cache")).unwrap().flatten().filter(|e| e.path().is_file()) {
+            std::fs::File::options().write(true).open(e.path()).unwrap().set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
+        }
+        let (before, after) = prune_shared_with(&shared_dir, &HashSet::new(), &HashSet::new(), Some(1));
+        assert!(before > 0 && after == 0, "the cap took the shared store ({before} -> {after} bytes)");
+        assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), ([false, false, true, true, true, true, true, true], [1, 1, 1, 0, 1]),
+            "after the eviction dep::same::<u32> misses, is compiled again and shared again; a2's own code hits");
         drop((ua, ub, ub2, ua2));
         std::fs::remove_dir_all(top).unwrap();
     }
@@ -11599,6 +11648,58 @@ mod prune_tests {
         prune(&root, &live, &HashSet::new(), &[(prog, roles2)], Some(u64::MAX));
         assert!(!parted_v1.exists());
         assert_eq!(std::fs::read_to_string(sets.join(format!("{me:016x}.retiring"))).unwrap(), "");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A shared code folder is kept by size alone (prune_shared): two checkouts of one program that
+    /// name different views of a crate (their store sets would retire each other's store) keep both
+    /// stores, and no store set is written there; under the cap every build's stores stay; over it
+    /// the least recently used go first, never this run's or a running build's.
+    #[test]
+    fn a_shared_code_folder_is_pruned_by_size_alone() {
+        isolated_test!(a_shared_code_folder_is_pruned_by_size_alone);
+        let root = std::env::temp_dir().join(format!("relax-shared-prune-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        let dir = root.join("cache");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = |name: &str, age_s: u64, build: Option<u64>| -> PathBuf {
+            let p = dir.join(name);
+            crate::store::append(&p, vec![NewEntry { key: 1, kind: KIND_DATA, payload: vec![7; 4096] }], true).unwrap();
+            if let Some(b) = build {
+                crate::store::set_build_for_test(&p, b);
+            }
+            let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_s);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+            p
+        };
+        let me = crate::store::this_build();
+        let (idle, alive) = (me ^ 0x1111, me ^ 0x2222);
+        let view_a = store("dep-00000000000000a1.rcs", 3000, None);
+        let view_b = store("dep-00000000000000b1.rcs", 2000, None);
+        let other = store("core-00000000000000c1.rcs", 4000, Some(idle));
+        let running = store("core-00000000000000d1.rcs", 5000, Some(alive));
+        let used = store("std-00000000000000e1.rcs", 6000, None);
+        let lock = std::fs::File::create(dir.join("live").join(format!("{alive:016x}"))).unwrap();
+        lock.lock_shared().unwrap();
+        let live: HashSet<PathBuf> = [used.clone()].into_iter().collect();
+        let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        // checkouts a, b, a of one program (one program identity), each naming its view of dep
+        for view in [&view_a, &view_b, &view_a] {
+            let roles: std::collections::BTreeMap<String, String> = [("code dep".to_string(), name(view))].into_iter().collect();
+            crate::store::note_program(0x5eed, &roles);
+            prune_shared_with(&root, &live, &HashSet::new(), Some(u64::MAX));
+        }
+        assert!(view_a.exists() && view_b.exists(), "neither checkout's view of dep retires the other's");
+        assert!(!dir.join("sets").exists(), "no store sets in a shared folder");
+        assert!(other.exists() && running.exists() && used.exists(), "under the cap every build's stores stay");
+        let size = |p: &PathBuf| std::fs::metadata(p).unwrap().len();
+        let all: u64 = [&view_a, &view_b, &other, &running, &used].iter().map(|p| size(p)).sum();
+        prune_shared_with(&root, &live, &HashSet::new(), Some(all - 1));
+        assert!(!other.exists(), "over the cap the least recently used store not in use goes first");
+        assert!(view_a.exists() && view_b.exists());
+        prune_shared_with(&root, &live, &HashSet::new(), Some(1));
+        assert!(!view_a.exists() && !view_b.exists(), "down to what is in use");
+        assert!(used.exists() && running.exists(), "this run's store and a running build's stay");
+        drop(lock);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
