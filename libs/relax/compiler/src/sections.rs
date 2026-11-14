@@ -17,6 +17,13 @@
 //! static of the program's current files that names it (rustc keeps a `#[used]` one however
 //! unreferenced; the others are kept here too). The block is fixed from then on, so an edit that
 //! adds, removes or moves one of its statics restarts the app (`edit_moves_a_section`).
+//!
+//! The statics of a crate the loader provides (bound: provided.rs) are not among them. They are
+//! the loader's, in the loader's own section where its linker placed them, as that crate's other
+//! statics are rustc's. A copy laid out from source would be a second one whose code is the
+//! crate's own (a `#[relax_api]` entry's key memo, a handle's field offsets), which JIT code may
+//! not run. A program that is a Relax host itself (a runner's test running its runner under a
+//! test harness, which binds the CPU budget) reads the entries of the crates it compiled.
 
 use crate::ast::{ItemId, ItemKind};
 use crate::jit::Unit;
@@ -126,7 +133,7 @@ fn lay_out(u: &mut Unit, group: &str) -> (u64, u64) {
     let current: std::collections::HashSet<u32> = u.prog.mods.iter().map(|m| m.file).collect();
     let mut members: Vec<(String, DefId)> = Vec::new();
     for (i, def) in u.prog.defs.iter().enumerate() {
-        if def.kind != DefKind::Static || !current.contains(&def.file) {
+        if def.kind != DefKind::Static || !current.contains(&def.file) || u.provided.iter().any(|(k, _)| *k == def.krate) {
             continue;
         }
         if let Some(s) = item_section(&u.prog.files[def.file as usize], def.item) {
@@ -182,7 +189,11 @@ pub(crate) fn place(u: &mut Unit, d: DefId, group: &str, bound: Option<bool>) ->
             }
             let def = u.prog.def(d);
             let at = u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo);
-            u.note_error(format!("{}: static `{}` is in link section `{}`, which this run laid out without it -- restart the app to lay the section out again", at, u.prog.def_path(d), group));
+            if u.provided.iter().any(|(k, _)| *k == def.krate) {
+                u.note_error(format!("{}: static `{}` is read from JIT-compiled code, but it is in link section `{}` of a provided crate (built by rustc into the loader): its one copy is the loader's, which JIT code reaches only through the crate's ops (#[relax_api])", at, u.prog.def_path(d), group));
+            } else {
+                u.note_error(format!("{}: static `{}` is in link section `{}`, which this run laid out without it -- restart the app to lay the section out again", at, u.prog.def_path(d), group));
+            }
             0
         }
     };
@@ -369,4 +380,47 @@ pub(crate) unsafe fn run_constructors(up: *mut Unit, root: u32, domain: Option<u
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::program::{DefId, DefKind};
+
+    /// A provided crate's static in a link section is the loader's: the section's block, laid out
+    /// when the program reads the section, leaves it out, and JIT code that names it is told why.
+    /// A runner's test (makepad-run's confined_macros under makepad test) binds the CPU budget and
+    /// reads the `#[relax_api]` table: its block took the budget's entries from source, whose
+    /// initializers JIT code may not run (`offset_of!(Wake, ..)`, a static key memo).
+    #[test]
+    fn a_provided_crates_section_statics_stay_the_loaders() {
+        isolated_test!(a_provided_crates_section_statics_stay_the_loaders);
+        crate::borrowck::lazy::disable_gandalf();
+        if std::env::var_os("RELAX_STD").is_none() {
+            std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        }
+        let dir = std::env::temp_dir().join(format!("relax-provided-section-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, "#[used]\n#[link_section = \"__DATA,__relax_t\"]\npub static ENTRY: u64 = 7;\n").unwrap();
+        let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "provided_section", false).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.def(d).krate == krate && prog.def(d).kind == DefKind::Static && prog.name(d) == "ENTRY").unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+        let mut u = crate::jit::Unit::new(prog, tcx, core);
+        // the crate provided as the loader provides the CPU budget (no op listed)
+        unsafe extern "C" fn no_panic_text(_: *mut *const u8, _: *mut usize) {}
+        let fixture = crate::provided::ProvidedCrate { name: "provided_section".into(), shims: Default::default(), types: Default::default(), layouts: Default::default(), per_side: Default::default(), last_panic: no_panic_text, source: 0, binding: 0, manifest: &[] };
+        u.provided.push((krate, fixture));
+        let (group, bound) = u.section_place(entry).expect("ENTRY is in a link section");
+        assert_eq!(bound, None);
+        let (start, end) = super::lay_out(&mut u, &group);
+        assert_eq!(u.sections[&group].members, Vec::<DefId>::new(), "the section's block took the provided crate's static");
+        assert_eq!(start, end, "the section's block has room for the provided crate's static");
+        assert_eq!(super::place(&mut u, entry, &group, None), 0, "JIT code was given an address for the provided crate's static");
+        assert!(u.errors.iter().any(|e| e.contains("static `") && e.contains("ENTRY` is read from JIT-compiled code, but it is in link section") && e.contains("of a provided crate")), "{:?}", u.errors);
+        // (process exit owns the runtime's teardown)
+        std::mem::forget(u);
+    }
 }
