@@ -865,6 +865,12 @@ pub(super) fn running_class(unit: usize, id: u32) -> Option<u8> {
     lock().running.iter().find(|r| r.waits_for(unit, id)).map(|r| r.class.class())
 }
 
+/// Whether a check waiter has registered its priority (concurrency regressions).
+#[cfg(test)]
+pub(super) fn waiting_for_test(unit: usize, id: u32) -> bool {
+    lock().waiters.get(&(unit, id)).is_some_and(|counts| counts.iter().any(|&n| n != 0))
+}
+
 /// Something waits for the check beside the program: its queued and running jobs take the waiter's
 /// class and go first in it (job_class and key give the jobs it queues from now on the same).
 pub(super) fn promote_checks() {

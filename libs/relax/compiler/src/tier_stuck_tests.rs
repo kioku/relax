@@ -8,6 +8,57 @@
 
 use super::*;
 
+/// An O3 candidate can reach its front while an ahead helper has finished checking it but
+/// has not published the body yet. That is pending work, not an unchecked body to leave out.
+#[test]
+fn a_prefront_waits_for_the_ahead_check_in_flight() {
+    isolated_test!(a_prefront_waits_for_the_ahead_check_in_flight);
+    crate::borrowck::lazy::disable_gandalf();
+    if std::env::var_os("RELAX_STD").is_none() {
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    }
+    let dir = std::env::temp_dir().join(format!("relax-inflight-front-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("input.rs");
+    std::fs::write(&path, "pub fn leaf(n: u32) -> u32 { n + 1 }\nfn main() {}\n").unwrap();
+    let (prog, core, krate) = crate::load_with_std(&std::sync::Arc::new(crate::Session::default()), path.to_str().unwrap(), "inflight_front", false).unwrap();
+    let d = prog.defs.iter().enumerate().find_map(|(i, def)| {
+        let id = DefId(i as u32);
+        (def.krate == krate && prog.name(id) == "leaf").then_some(id)
+    }).unwrap();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
+    let mut u = Unit::new(prog, tcx, core);
+    let up = &mut *u as *mut Unit;
+    unsafe { UNIT = up };
+    let (id, epoch, body) = crate::owner::call(crate::owner::Class::Program, || {
+        let id = u.fn_id(FnKey::Inst(d, Vec::new()));
+        let body = u.tcx.typeck(&u.prog, d);
+        assert!(body.errors.is_empty() && body.deferred_misses.is_empty());
+        (id, u.tcx.collect_epoch.load(Ordering::SeqCst), body)
+    });
+    let front = u.front.clone();
+    let key = (d, Vec::new());
+    // Pause a helper immediately before publish_ahead/inprog_end, with a valid checked body.
+    assert!(front.inprog.lock().unwrap().insert(key.clone()));
+    let worker_front = front.clone();
+    let worker = std::thread::spawn(move || prefront_slot(&worker_front, id));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // Observe the waiter's state, not a sleep or a minimum wait duration. The old path exits
+    // unchecked here instead; the deadline only bounds a broken test's synchronization.
+    while !worker.is_finished() && !queue::waiting_for_test(up as usize, id) {
+        assert!(std::time::Instant::now() < deadline, "prefront neither waited nor finished");
+        std::thread::yield_now();
+    }
+    publish_ahead(&front, key.clone(), epoch, body);
+    inprog_end(&front, &key);
+    assert!(worker.join().unwrap(), "the prefront treated an in-flight check as an unchecked body");
+    assert!(matches!(front.lowered.lock().unwrap().get(&id), Some(LoweredState::Ready(_))));
+    std::mem::forget(u);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 const SOURCE: &str = r#"
 const fn three() -> u32 { 3 }
 const K: u32 = 40 + three();

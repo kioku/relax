@@ -26363,6 +26363,7 @@ fn prefront_slot_once(front: &FrontShared, id: u32) -> bool {
         // map in lower_ahead (stale), and is checked again under the current collection
         for _ in 0..2 {
             typeck_ahead(front, key.0, key.1.clone(), 0, false, false);
+            wait_for_ahead_check(front, front.unit.load(Ordering::Acquire) as usize, id, &key);
             PREFRONTS[2].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
             why = lower_ahead(front, id, true);
             if why != AF_STALE || front.ahead.contains_key(&key) { break; }
@@ -28032,6 +28033,22 @@ fn ahead_check_diag(u: &Unit, id: u32, reason: &str, ns: u64) {
     }
 }
 
+/// A body another ahead job is checking is pending, not absent. Both a program thread's
+/// front and an O3 candidate's front wait for that publication before trying to lower it.
+/// Wait without a front read or CPU budget: the helper may need a writer or that core.
+fn wait_for_ahead_check(f: &FrontShared, unit: usize, id: u32, key: &AheadKey) {
+    if owner::is_owner() || front_reads_held() > 0 || !queue::waits_on_helpers()
+        || !f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(key) { return; }
+    let _priority = queue::promote(unit, id, owner::waiter_class());
+    let _budget = crate::pool::suspend();
+    let _idle = JobIdle::enter();
+    let _w = AheadWait::begin(0);
+    let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+    while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(key) && f.alive.load(Ordering::SeqCst) {
+        g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
+    }
+}
+
 /// Type-checks slot `id`'s body ahead (no unit lock held). `up` only reaches the unit's
 /// FrontShared (a field never written after the unit is set up).
 pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
@@ -28058,20 +28075,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
         let t0 = cpu_ns();
         let key = (d, args.clone());
         typeck_ahead(&f, d, args, 3, false, false);
-        // a helper is checking this very body: wait for its result rather than check it again
-        // under the unit lock (not while holding that lock: a constant evaluation's call). Not
-        // while helpers may run at the idle policy (queue::waits_on_helpers): the front checks it
-        if !owner::is_owner() && queue::waits_on_helpers() && f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) {
-            let _priority = queue::promote(up as usize, id, owner::waiter_class());
-            let _budget = crate::pool::suspend();
-            // (a wait for another thread: not a running job meanwhile, job_sleep's reason)
-            let _idle = JobIdle::enter();
-            let _w = AheadWait::begin(0);
-            let mut g = AHEAD_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
-            while f.inprog.lock().unwrap_or_else(|e| e.into_inner()).contains(&key) && f.alive.load(Ordering::SeqCst) {
-                g = AHEAD_DONE.1.wait_timeout(g, std::time::Duration::from_millis(5)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
-            }
-        }
+        wait_for_ahead_check(&f, up as usize, id, &key);
         let w = IS_WORKER.try_with(|w| w.get()).unwrap_or(false);
         let mut t1 = cpu_ns();
         AHEAD_STATS[if w { 4 } else { 3 }].fetch_add(t1 - t0, Ordering::Relaxed);
