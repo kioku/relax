@@ -1756,6 +1756,9 @@ impl Tcx {
                 }
             }
         }
+        // a variant's clauses (its enum's, lowered for the variant) are computed here too, not first
+        // by a body that names the variant (body_facts.rs item_text: their errors are the enum's)
+        if def.kind == DefKind::Variant { let _ = self.own_clauses_of(prog, did); }
         if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
             let ast = &prog.files[def.file as usize].ast;

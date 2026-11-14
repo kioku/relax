@@ -51,6 +51,9 @@ fn check_in_child_store(dir: &std::path::Path, reuse: bool, store: &std::path::P
         }
         if let Some(c) = l.strip_prefix("reuse child exit ") { run.code = c.parse().unwrap(); }
     }
+    // the owners phase computes every item cell of a fresh crate (body_facts.rs item_text): no
+    // body is the first to read interface text, so no check's import uses depend on which bodies ran
+    assert_eq!(run.in_body, 0, "interface text first read in a body: {}", stderr.lines().find(|l| l.contains("items resolved in a body")).unwrap_or(""));
     run
 }
 
