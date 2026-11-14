@@ -301,6 +301,35 @@ fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1e3
 }
 
+/// The settle's steps off the owner and on it, timed for its summary line: a frame a program
+/// thread loses during a settle is matched to the step that ran then (the steps between the
+/// restore and the cache open were untimed, and a frame lost there was taken for the settle's).
+#[derive(Default)]
+struct Steps(Vec<(&'static str, f64)>);
+impl Steps {
+    fn time<R>(&mut self, what: &'static str, f: impl FnOnce() -> R) -> R {
+        let t = Instant::now();
+        let r = f();
+        self.0.push((what, ms(t)));
+        r
+    }
+    /// An owner call: how long it waited for the owner and how long it held it.
+    fn owner<R>(&mut self, what: &'static str, f: impl FnOnce() -> R) -> R {
+        let t = Instant::now();
+        let (r, t_in, held) = owner::call(owner::Class::Program, || {
+            let t_in = Instant::now();
+            let r = f();
+            (r, t_in, ms(t_in))
+        });
+        self.0.push((what, held));
+        self.0.push(("  its wait for the owner", t_in.duration_since(t).as_secs_f64() * 1e3));
+        r
+    }
+    fn said(&self) -> String {
+        self.0.iter().map(|(w, ms)| format!("{} {ms:.1}", w.trim_start())).collect::<Vec<_>>().join(", ")
+    }
+}
+
 /// The replaced compile state of the Unit, dropped by value off the owner. (The slot fields
 /// `calls`, `rir_refs` and `spec` are ids and code: they stay.)
 struct Old {
@@ -366,6 +395,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     RUNNING.store(true, Ordering::Relaxed);
     let _running = Running;
     let t_all = Instant::now();
+    let mut steps = Steps::default();
     let rss0 = crate::memstat::resident();
     let boot = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
     let sess = unsafe { unit_session(up) };
@@ -378,12 +408,12 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     // the recorded entries go to the stores now, off the owner: the new cache opens the stores
     // as they are, and an entry recorded but not yet written would be unknown to it (every slot
     // such entries hold compiled again: a large app's settled state grew back to 18k RIR bodies)
-    let spill = owner::publish(|| unsafe {
+    let spill = steps.time("records flushed and taken first (a publish)", || owner::publish(|| unsafe {
         (*up).flush_cache_records();
         (*up).cache.as_mut().and_then(|c| c.spill_take())
-    });
+    }));
     if let Some(s) = spill {
-        if let Err(e) = s.write() {
+        if let Err(e) = steps.time("spill written first", || s.write()) {
             return Outcome::Retry(format!("the cache spill failed: {e}"));
         }
     }
@@ -398,7 +428,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     let stored = *STORED.lock().unwrap_or_else(|e| e.into_inner());
     // the run's resident cache file pages go first: the encode adds its image to what the old
     // state holds
-    crate::pack::release_resident();
+    steps.time("pages released before the encode", crate::pack::release_resident);
     let (before, encoded, pre) = {
         let _c = crate::zone_alloc::compiler();
         let r = front_read("settle rebuild encode");
@@ -438,7 +468,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     // the cache files' pages this process has resident (the old state's images, read by the
     // encode) go before the new state maps its own: never both at once (they are read-only file
     // pages; a later read faults one back from the page cache)
-    crate::pack::release_resident();
+    steps.time("pages released after it", crate::pack::release_resident);
     let encode_ms = ms(t);
     let encode = if encoded { format!("encode {encode_ms:.1} ms") } else { "no encode (the store holds the program's image)".to_string() };
     trace(&encode);
@@ -493,7 +523,7 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     trace(&format!("restored in {restore_ms:.1} ms"));
     // the new image's pages the restore read go again: the new state faults back what it uses,
     // as a warm start does
-    crate::pack::release_resident();
+    steps.time("pages released after the restore", crate::pack::release_resident);
 
     // 3. the replace, on the owner under a front write; what the cache recorded so far is
     // written first, off the owner (the replace writes only what comes after this)
@@ -502,14 +532,14 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     // and found by the next start). The records made so far are encoded first in bounded
     // publishes, a batch per owner hold, as the run monitor drains them: the call below takes
     // only what is left (in a cold run thousands, else a long owner hold)
-    super::drain_records_bounded();
-    let (spill, settings) = owner::call(owner::Class::Program, || unsafe {
+    steps.time("records drained", super::drain_records_bounded);
+    let (spill, settings) = steps.owner("the rest flushed and taken on the owner", || unsafe {
         let u = &mut *up;
         u.flush_cache_records();
         (u.cache.as_mut().and_then(|c| c.spill_take()), (u.opt.clone(), u.tier1.is_some(), u.provided.iter().map(|(k, pc)| (*k, pc.binding)).collect::<Vec<_>>()))
     });
     if let Some(s) = spill {
-        if let Err(e) = s.write() { return failed(format!("the cache spill failed: {e}")); }
+        if let Err(e) = steps.time("spill written", || s.write()) { return failed(format!("the cache spill failed: {e}")); }
     }
     let mut fresh = fresh;
     let t_open = Instant::now();
@@ -524,23 +554,24 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
         fresh.cache = Some(cache);
     }
     trace(&format!("cache opened in {:.1} ms", ms(t_open)));
+    steps.0.push(("cache opened", ms(t_open)));
     // and the pages the open read once (indexes, ledgers), before the replace
-    crate::pack::release_resident();
+    steps.time("pages released after the open", crate::pack::release_resident);
     // what was recorded while the cache opened goes the same way, so that the replace's own flush
     // and spill, on the owner under the front write, are only what the last moments added
     let t = Instant::now();
-    super::drain_records_bounded();
-    let spill = owner::call(owner::Class::Program, || unsafe {
+    steps.time("records drained again", super::drain_records_bounded);
+    let spill = steps.owner("the rest flushed and taken again", || unsafe {
         let u = &mut *up;
         u.flush_cache_records();
         u.cache.as_mut().and_then(|c| c.spill_take())
     });
     if let Some(s) = spill {
-        if let Err(e) = s.write() { return failed(format!("the cache spill failed: {e}")); }
+        if let Err(e) = steps.time("spill written again", || s.write()) { return failed(format!("the cache spill failed: {e}")); }
     }
     let spill_ms = ms(t);
     let t = Instant::now();
-    let replaced = owner::call(owner::Class::Program, || unsafe { replace(up, &sess, mode, fresh, before) });
+    let replaced = steps.owner("replaced on the owner", || unsafe { replace(up, &sess, mode, fresh, before) });
     let old = match replaced {
         Ok(old) => old,
         Err(o) => return o,
@@ -550,19 +581,21 @@ pub(crate) fn run(up: *mut Unit, patient: bool) -> Outcome {
     // 4. the old state goes by value, off the owner (on this, the monitor's, thread)
     let t = Instant::now();
     note_replaced_front(&old._front);
-    drop(old);
+    steps.time("old state dropped", || drop(old));
     // the process-wide memos that only grow go too (made again on demand)
-    drop_compile_memos();
-    relax_types::tcx::drop_process_memos();
-    crate::program::drop_shared_std();
+    steps.time("memos dropped", || {
+        drop_compile_memos();
+        relax_types::tcx::drop_process_memos();
+    });
+    steps.time("shared std dropped", crate::program::drop_shared_std);
     let drop_ms = ms(t);
-    crate::memstat::trim();
-    crate::pack::release_resident();
+    steps.time("heap trimmed", crate::memstat::trim);
+    steps.time("pages released at the end", crate::pack::release_resident);
     let rss1 = crate::memstat::resident();
     trace("the old state dropped");
     REBUILDS.fetch_add(1, Ordering::Relaxed);
-    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("relax settle rebuild at t={:.0} ms: {}, restore {:.1} ms, spill {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB",
-        crate::clock::ms_since_start(), encode, restore_ms, spill_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0); }
+    if crate::run::VERBOSE.load(Ordering::Relaxed) || crate::memstat::enabled() { eprintln!("relax settle rebuild at t={:.0} ms: {}, restore {:.1} ms, spill {:.1} ms, replace on the owner {:.1} ms, old state dropped in {:.1} ms; total {:.1} ms; rss {:.0} -> {:.0} MB; steps (ms): {}",
+        crate::clock::ms_since_start(), encode, restore_ms, spill_ms, replace_ms, drop_ms, ms(t_all), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0, steps.said()); }
     Outcome::Done
 }
 
