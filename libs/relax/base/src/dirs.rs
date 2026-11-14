@@ -114,6 +114,12 @@ impl Anchors {
         h.finish128()
     }
 
+    /// The places no checkout owns (the cargo home, std's folder), absolute: where a late input of
+    /// a shared code store's ledger may lie.
+    pub fn machine_dirs(&self) -> impl Iterator<Item = &str> {
+        self.dirs.iter().filter(|(tag, _)| *tag == "cargo").map(|(_, dir)| dir.as_str()).chain(std::iter::once(self.std.as_str()))
+    }
+
     /// The checkout's folders (the workspace, the run dir), absolute: text a sealed entry never
     /// holds.
     pub fn checkout_dirs(&self) -> impl Iterator<Item = &str> {

@@ -807,6 +807,12 @@ pub struct Cache {
     /// what a sealed slot's code key takes in place of anchors_key: the places no checkout owns
     /// (Anchors::machine_key) and the target, the same in every checkout over them
     sealed_key: u128,
+    /// the code keys made with the sealed key, and the verdict keys over them: a borrowck or tier
+    /// verdict of such a key goes to the shared store of its store crate with the code
+    sealed_keys: HashSet<u128>,
+    /// the places no checkout owns (Anchors::machine_dirs): a shared store's ledger names files
+    /// under them only (SharedMerge)
+    machine_dirs: Vec<String>,
     /// the shared code stores (OpenFrom::shared): per crate the path of its store there (sealed
     /// crates only) and whether it is stale (a late input changed: never written by this run);
     /// a pending entry for crate c's shared store is filed under c + the crate count
@@ -1264,6 +1270,8 @@ impl Cache {
             anchors_key: anchors.key(),
             sealed,
             sealed_key,
+            sealed_keys: HashSet::new(),
+            machine_dirs: anchors.machine_dirs().map(String::from).collect(),
             shared,
             shared_path,
             shared_stale: vec![false; ncr],
@@ -1593,13 +1601,17 @@ impl Cache {
         // the shared code stores: a stale one (a late input of its scope changed) is neither read
         // nor written; under a key a checkout store has too, the entry of the higher tier
         let shared_crates: Vec<usize> = (0..ncr).filter(|&ci| c.shared_path[ci].is_some()).collect();
+        let ident_names: HashMap<String, String> = if shared_crates.is_empty() { HashMap::new() } else {
+            c.crate_ident.iter().zip(&c.crate_names).map(|(id, n)| (ident_hex(*id), n.clone())).collect()
+        };
+        let name_of = |id: &str| ident_names.get(id).cloned();
         for (ci, st) in shared_crates.into_iter().zip(shared_opened) {
             let Some(st) = st else { continue };
-            if !ledger_current(&st, &present, &mut late) {
+            if !ledger_current_named(&st, &name_of, &mut late) {
                 c.shared_stale[ci] = true;
                 continue;
             }
-            replay_store_ledger(&st, &present, &late);
+            replay_store_ledger_named(&st, &name_of, &late);
             let si = c.stores.len() as u32;
             for (e, ix) in st.index.iter().enumerate() {
                 if matches!(ix.kind, KIND_LEDGER | KIND_MANIFEST | KIND_FRONT | KIND_FRONT_REF | KIND_FRONT_CRATE) { continue; }
@@ -1801,6 +1813,13 @@ impl Cache {
             && self.shared_path.get(c as usize).is_some_and(|p| p.is_some()) && self.shared_stale.get(c as usize) == Some(&false)
     }
 
+    /// The pending store of a verdict over code key `key` (a borrowck or tier verdict) whose store
+    /// crate is `kc`: the shared store of kc when the key is sealed and the run writes it there (the
+    /// verdict rests on sealed crates alone, as the code does), else kc's own.
+    fn verdict_store(&self, key: u128, kc: u32) -> u32 {
+        if self.sealed_keys.contains(&key) && self.shared_writable(kc) { self.shared_id(kc) } else { kc }
+    }
+
     /// Whether store `p` (of `stores`) is a shared code store.
     fn is_shared_store(&self, p: u32) -> bool {
         self.shared.as_ref().is_some_and(|sh| self.stores.get(p as usize).is_some_and(|st| st.path.starts_with(&sh.dir)))
@@ -1864,21 +1883,34 @@ impl Cache {
         let late = crate::sip::late_inputs();
         let moved = crate::sip::late_moved();
         let mut files = Vec::new();
+        let mut shared = Vec::new();
         let n = self.code_path.len() as u32;
-        for ((c, front), mut entries) in self.by_store_shared(pending, &late) {
-            // (a shared store holds crates whose closure reads no late input: by_store_shared)
+        for ((c, front), mut entries) in self.by_store_shared(pending) {
             if self.reads_moved(self.crate_of_store(c), front, &moved) {
                 continue;
             }
+            if !front && c >= n {
+                // written under the shared store's lock (Spill::write); refused, it goes to the
+                // crate's checkout store, emptied here first when that one was found stale
+                let ci = c - n;
+                let Some((path, _)) = self.store_of(c, false) else { continue };
+                let fallback_ledger = self.code_ledger(ci, &late);
+                let merge = self.shared_merge(ci, &late);
+                let Some((fallback, stale)) = self.store_of(ci, false) else { continue };
+                if std::mem::replace(stale, false) {
+                    files.push((fallback.clone(), true, vec![NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: fallback_ledger.clone() }]));
+                }
+                shared.push(SharedSpill { path, entries, merge, fallback, fallback_ledger });
+                continue;
+            }
             if !front {
-                entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: self.code_ledger(self.crate_of_store(c), &late) }.into());
+                entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: self.code_ledger(c, &late) }.into());
             }
             let Some((path, stale)) = self.store_of(c, front) else { continue };
-            // (a shared store is never replaced whole)
-            let stale = std::mem::replace(stale, false) && (front || c < n);
+            let stale = std::mem::replace(stale, false);
             files.push((path, stale, entries));
         }
-        Some(Spill { dir: self.dir.clone(), files, marks })
+        Some(Spill { dir: self.dir.clone(), files, shared, marks })
     }
 
     // ------------------------------------------------------------ stable identities
@@ -3033,6 +3065,10 @@ impl Cache {
             }
         };
         self.key_crate.insert(k, dom);
+        // (only with shared stores: a run without them writes every verdict to its checkout)
+        if self.shared.is_some() && crates.iter().all(|&c| self.sealed.get(c as usize) == Some(&true)) {
+            self.sealed_keys.insert(k);
+        }
         Some((k, crates, e.0))
     }
 
@@ -3308,6 +3344,9 @@ impl Cache {
         let k = h.finish128();
         let dom = self.key_crate.get(&code).copied().unwrap_or(0);
         self.key_crate.insert(k, dom);
+        if self.sealed_keys.contains(&code) {
+            self.sealed_keys.insert(k);
+        }
         Some(k)
     }
 
@@ -3439,6 +3478,7 @@ impl Cache {
     pub fn record_borrowck(&mut self, key: u128, v: StoredVerdict) {
         if self.pending_keys.insert(key) {
             let kc = self.key_crate.get(&key).copied().unwrap_or(0);
+            let kc = self.verdict_store(key, kc);
             self.push_pending(kc, NewEntry { key, kind: KIND_BORROWCK, payload: enc_verdict(&v) });
             self.pending_verdicts.insert(key, v);
         }
@@ -3842,6 +3882,7 @@ impl Cache {
         let vk = key ^ salt;
         if self.has_index(&vk) || !self.pending_keys.insert(vk) { return; }
         let kc = self.key_crate.get(&key).copied().unwrap_or(0);
+        let kc = self.verdict_store(key, kc);
         self.push_pending(kc, NewEntry { key: vk, kind: KIND_TIER, payload });
     }
 
@@ -4709,17 +4750,32 @@ impl Cache {
         pack::ensure_private_dir(&self.dir)?;
         let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
         let ncode = self.code_path.len() as u32;
-        for ((c, front), mut entries) in self.by_store_shared(pending, &late) {
-            // (a shared store holds crates whose closure reads no late input: by_store_shared)
+        for ((c, front), entries) in self.by_store_shared(pending) {
             if self.reads_moved(self.crate_of_store(c), front, &moved) {
                 continue;
             }
+            // a shared store's batch: written with its ledger merged with the one on disk, under the
+            // store's lock (SharedMerge); refused, it goes to the crate's checkout store
+            let (c, mut entries) = if !front && c >= ncode {
+                let ci = c - ncode;
+                let Some((path, _)) = self.store_of(c, false) else { continue };
+                let merge = self.shared_merge(ci, &late);
+                match crate::store::append_ledgered(&path, entries, LEDGER_KEY, &mut |disk| merge.merge(disk).map(|payload| NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload })) {
+                    Ok(None) => continue,
+                    Ok(Some(back)) => {
+                        self.shared_refused(ci, &back);
+                        (ci, back)
+                    }
+                    Err(e) => return Err(format!("{}: {}", path.display(), e)),
+                }
+            } else {
+                (c, entries)
+            };
             // the ledger: the include!/env! inputs as this run saw them -- the crate's own for its
-            // front store, its dependency closure's for its code store (a shared store's: empty)
-            let ledger = if front { None } else { Some(self.code_ledger(self.crate_of_store(c), &late)) };
+            // front store, its dependency closure's for its code store
+            let ledger = if front { None } else { Some(self.code_ledger(c, &late)) };
             let Some((path, stale)) = self.store_of(c, front) else { continue };
-            // (a shared store is never replaced whole)
-            let stale = std::mem::replace(stale, false) && (front || c < ncode);
+            let stale = std::mem::replace(stale, false);
             let payload = ledger.unwrap_or_else(|| own_ledger(&path, &late));
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload }.into());
             append_store(&path, entries, stale, &marks)?;
@@ -4814,25 +4870,112 @@ impl Cache {
         }
     }
 
-    /// by_store, a shared store's batch checked against its ledger first: a late input in its
-    /// scope (its crate's closure) keeps the batch, and the run's later records of that crate, in
-    /// the checkout's code store of the crate (same keys): a shared store's ledger stays empty
-    /// (Target B step 3; merging ledgers under the store lock is step 4).
-    fn by_store_shared(&mut self, pending: Vec<(u32, NewEntry)>, late: &[(String, u8, String, u128)]) -> HashMap<(u32, bool), Vec<NewEntry>> {
+    /// by_store, the batch of a shared store this run no longer writes (its ledger refused an
+    /// earlier batch: shared_refused) in the checkout's code store of the crate (same keys).
+    fn by_store_shared(&mut self, pending: Vec<(u32, NewEntry)>) -> HashMap<(u32, bool), Vec<NewEntry>> {
         let mut by = by_store(pending);
         let n = self.code_path.len() as u32;
-        let empty = encode_ledger(std::iter::empty());
         let shared: Vec<u32> = by.keys().filter(|(c, front)| !front && *c >= n).map(|(c, _)| *c).collect();
         for s in shared {
             let c = s - n;
-            if self.code_ledger(c, late) == empty { continue; }
+            if self.shared_stale.get(c as usize) != Some(&true) { continue; }
             let entries = by.remove(&(s, false)).unwrap_or_default();
             self.stats.shared_kept_out += entries.iter().filter(|e| e.kind == KIND_CODE).count() as u64;
-            if let Some(stale) = self.shared_stale.get_mut(c as usize) { *stale = true; }
             by.entry((c, false)).or_default().extend(entries);
         }
         by
     }
+
+    /// Crate `c`'s shared store refused a batch (`entries`, now the checkout store's): its ledger on
+    /// disk names a value this run does not have, or this run's names a file under the checkout.
+    /// The run writes no more to it.
+    fn shared_refused(&mut self, c: u32, entries: &[NewEntry]) {
+        if let Some(stale) = self.shared_stale.get_mut(c as usize) { *stale = true; }
+        self.stats.shared_kept_out += entries.iter().filter(|e| e.kind == KIND_CODE).count() as u64;
+        if self.verbose {
+            eprintln!("relax cache: the shared code store of crate {} refused {} entries: its ledger and this run's late inputs differ", self.crate_names.get(c as usize).map_or("?", |n| n.as_str()), entries.len());
+        }
+    }
+
+    /// The merge of crate `c`'s shared store ledger (SharedMerge) under this run's late inputs.
+    fn shared_merge(&self, c: u32, late: &[(String, u8, String, u128)]) -> SharedMerge {
+        let index: HashMap<&str, usize> = self.crate_names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+        let set = self.crate_closure.get(c as usize);
+        let in_scope = |i: usize| set.is_some_and(|set| set.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1));
+        let run = late.iter().filter_map(|(cn, k, name, h)| {
+            let i = *index.get(cn.as_str())?;
+            if !in_scope(i) { return None; }
+            Some((ident_hex(*self.crate_ident.get(i)?), *k, name.clone(), *h))
+        }).collect();
+        SharedMerge {
+            run,
+            names: self.crate_ident.iter().zip(&self.crate_names).map(|(id, n)| (ident_hex(*id), n.clone())).collect(),
+            late: late.iter().map(|(c, k, n, h)| ((c.clone(), *k, n.clone()), *h)).collect(),
+            machine: self.machine_dirs.clone(),
+            verbose: self.verbose,
+        }
+    }
+}
+
+/// A crate's identity (Cache::crate_ident) as a shared store's ledger names the crate: the same in
+/// every checkout over the crate's sources (a multi-version name can hold a unit index).
+fn ident_hex(id: u128) -> String {
+    format!("{id:032x}")
+}
+
+/// The merge of a shared code store's ledger with the one on disk, under the store's lock
+/// (store::append_ledgered). The batch is written when every input the disk ledger names for a crate
+/// of this program has this run's value, and none of this run's inputs is a file outside the places
+/// no checkout owns (another checkout would check it against its own tree). The ledger written is
+/// the disk's, verbatim (inputs of crates this program lacks included), plus this run's it lacks.
+/// Else nothing is written: the batch goes to the checkout's store (Fable's ledger rule, step 4).
+struct SharedMerge {
+    /// this run's late inputs of the crate's closure, crates by ident (ident_hex)
+    run: Vec<(String, u8, String, u128)>,
+    /// ident (ident_hex) -> this program's crate name, every crate of the program
+    names: HashMap<String, String>,
+    /// this run's late inputs, by (crate name, kind, name)
+    late: HashMap<(String, u8, String), u128>,
+    /// the places no checkout owns (Anchors::machine_dirs)
+    machine: Vec<String>,
+    verbose: bool,
+}
+
+impl SharedMerge {
+    fn merge(&self, disk: Option<&[u8]>) -> Option<Vec<u8>> {
+        let say = |why: String| if self.verbose { eprintln!("relax cache: shared store ledger: {why}"); };
+        if let Some((_, _, name, _)) = self.run.iter().find(|(_, k, name, _)| crate::sip::late_base(*k) == crate::sip::LATE_FILE
+            && !self.machine.iter().any(|m| std::path::Path::new(name).starts_with(m))) {
+            say(format!("the included file {name} lies in the checkout"));
+            return None;
+        }
+        let mut all = match disk {
+            Some(b) => decode_ledger(b)?,
+            None => Vec::new(),
+        };
+        for (c, k, name, h) in &all {
+            let Some(cname) = self.names.get(c) else { continue };
+            let now = self.late.get(&(cname.clone(), *k, name.clone())).copied().unwrap_or_else(|| late_now(cname, *k, name));
+            if now != *h {
+                say(format!("crate {cname}: `{name}` differs from the stored value"));
+                return None;
+            }
+        }
+        let have: HashSet<(String, u8, String)> = all.iter().map(|(c, k, n, _)| (c.clone(), *k, n.clone())).collect();
+        all.extend(self.run.iter().filter(|(c, k, n, _)| !have.contains(&(c.clone(), *k, n.clone()))).cloned());
+        all.sort();
+        Some(encode_ledger(all.iter()))
+    }
+}
+
+/// A spill's batch for a shared code store (Cache::spill_take): written under the store's lock with
+/// `merge`; refused, to `fallback` (the crate's checkout store) under `fallback_ledger`.
+struct SharedSpill {
+    path: PathBuf,
+    entries: Vec<NewEntry>,
+    merge: SharedMerge,
+    fallback: PathBuf,
+    fallback_ledger: Vec<u8>,
 }
 
 /// Every spelling of a checkout's folders (Anchors::checkout_dirs: the workspace, the run dir) a
@@ -4909,6 +5052,8 @@ fn resolved_spelling(dir: &str) -> String {
 pub struct Spill {
     dir: PathBuf,
     files: Vec<(PathBuf, bool, Vec<NewEntry>)>,
+    /// batches of the shared code stores, written after `files`
+    shared: Vec<SharedSpill>,
     /// the images their references name, written by the time they were taken
     marks: front_run::RunMarks,
 }
@@ -4963,6 +5108,26 @@ impl Spill {
                 // process state: kept heap
                 let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
                 crate::zone_alloc::kept_with(|| w.push((self.dir.clone(), path.clone(), code.clone())));
+            }
+        }
+        // a shared store's batch with its ledger merged under the store's lock; refused, the
+        // checkout store's (the run's later batches try again: the spill does not stop them)
+        for SharedSpill { path, entries, merge, fallback, fallback_ledger } in self.shared {
+            n += entries.len();
+            let code: Vec<u128> = entries.iter().filter(|e| e.kind == KIND_CODE || e.kind == KIND_DATA).map(|e| e.key).collect();
+            let back = crate::store::append_ledgered(&path, entries, LEDGER_KEY, &mut |disk| merge.merge(disk).map(|payload| NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload }))
+                .map_err(|e| format!("{}: {}", path.display(), e))?;
+            let at = match back {
+                None => path,
+                Some(mut back) => {
+                    back.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: fallback_ledger });
+                    append_store(&fallback, back, false, &self.marks)?;
+                    fallback
+                }
+            };
+            if !code.is_empty() {
+                let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+                crate::zone_alloc::kept_with(|| w.push((self.dir.clone(), at.clone(), code.clone())));
             }
         }
         Ok(n)
@@ -5103,6 +5268,32 @@ fn payload_tier(p: &[u8]) -> Option<u8> {
 /// Whether a pack's recorded late macro inputs (include!/env! contents) still have the same
 /// content: a pack from a run that read different bytes is not used.
 fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, String, String), u128>) -> bool {
+    ledger_current_named(p, &|c| present.contains(c).then(|| c.to_string()), memo)
+}
+
+/// The value a late input has now: an included file's contents or crate `c`'s environment variable.
+fn late_now(c: &str, k: u8, name: &str) -> u128 {
+    if crate::sip::late_base(k) == crate::sip::LATE_FILE {
+        crate::sip::late_hash(crate::vfs::read(name).ok().as_deref())
+    } else {
+        crate::sip::late_hash(crate::crates::crate_env_named(c, name).as_deref().map(|s| s.as_bytes()))
+    }
+}
+
+/// A ledger's entries: (crate, kind, name, content hash); None: it does not decode.
+fn decode_ledger(payload: &[u8]) -> Option<Vec<(String, u8, String, u128)>> {
+    let mut d = D { b: payload, p: 0 };
+    let n = d.u32()?;
+    let mut v = Vec::with_capacity(n.min(1 << 16) as usize);
+    for _ in 0..n {
+        v.push((d.str()?.to_string(), d.u8()?, d.str()?.to_string(), d.u128()?));
+    }
+    Some(v)
+}
+
+/// ledger_current, the crate a ledger entry names mapped to this program's crate name by `name_of`
+/// (None: not in this program; a shared store's ledger names crates by ident).
+fn ledger_current_named(p: &Store, name_of: &dyn Fn(&str) -> Option<String>, memo: &mut HashMap<(u8, String, String), u128>) -> bool {
     let payload = match p.get(LEDGER_KEY) {
         Some((KIND_LEDGER, b)) => b,
         _ => return false,
@@ -5117,17 +5308,10 @@ fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, 
             (Some(c), Some(k), Some(n), Some(h)) => (c, k, n, h),
             _ => return false,
         };
-        if !present.contains(c) {
-            continue;
-        }
+        let Some(c) = name_of(c) else { continue };
+        let c = c.as_str();
         // each input is read once per open, however many packs name it
-        let now = *memo.entry((k, c.to_string(), name.to_string())).or_insert_with(|| {
-            if crate::sip::late_base(k) == crate::sip::LATE_FILE {
-                crate::sip::late_hash(crate::vfs::read(name).ok().as_deref())
-            } else {
-                crate::sip::late_hash(crate::crates::crate_env_named(c, name).as_deref().map(|s| s.as_bytes()))
-            }
-        });
+        let now = *memo.entry((k, c.to_string(), name.to_string())).or_insert_with(|| late_now(c, k, name));
         if now != h {
             if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("relax cache: stale code store: crate {c}: late input {} `{name}` changed (stored {h:032x}, now {now:032x})", if crate::sip::late_base(k) == crate::sip::LATE_FILE { "file" } else { "env" });
@@ -5141,16 +5325,19 @@ fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, 
 /// Replays a validated pack's `KIND_LEDGER` into `sip` (with the hashes `ledger_current` just
 /// verified), so a later write's ledger still lists the inputs this run took from the cache.
 fn replay_store_ledger(p: &Store, present: &HashSet<String>, memo: &HashMap<(u8, String, String), u128>) {
+    replay_store_ledger_named(p, &|c| present.contains(c).then(|| c.to_string()), memo)
+}
+
+/// replay_store_ledger, crates mapped as ledger_current_named maps them.
+fn replay_store_ledger_named(p: &Store, name_of: &dyn Fn(&str) -> Option<String>, memo: &HashMap<(u8, String, String), u128>) {
     let Some((KIND_LEDGER, payload)) = p.get(LEDGER_KEY) else { return };
     let mut d = D { b: payload, p: 0 };
     let Some(n) = d.u32() else { return };
     for _ in 0..n {
         let (Some(c), Some(k), Some(name), Some(h)) = (d.str(), d.u8(), d.str(), d.u128()) else { return };
-        if !present.contains(c) {
-            continue;
-        }
-        let cur = memo.get(&(k, c.to_string(), name.to_string())).copied().unwrap_or(h);
-        crate::sip::note_late_hash(c, k, name, cur);
+        let Some(c) = name_of(c) else { continue };
+        let cur = memo.get(&(k, c.clone(), name.to_string())).copied().unwrap_or(h);
+        crate::sip::note_late_hash(&c, k, name, cur);
     }
 }
 
@@ -6548,7 +6735,7 @@ pub(crate) fn record_added_crates(prog: &crate::program::Program, dir: &std::pat
         let lock = front_store_lock(&path);
         let _store = lock.lock().unwrap_or_else(|e| e.into_inner());
         let guard = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
-        Spill { dir: dir.to_owned(), files: vec![(path, false, entries)], marks: marks.clone() }.write_locked(&guard, &late)?;
+        Spill { dir: dir.to_owned(), files: vec![(path, false, entries)], shared: Vec::new(), marks: marks.clone() }.write_locked(&guard, &late)?;
     }
     let mut probes: std::collections::BTreeMap<String, bool> = base.probes.iter().cloned().collect();
     for (p, exists) in &prog.module_probes { probes.entry(p.clone()).or_insert(*exists); }
@@ -7774,7 +7961,7 @@ fn write_front_record(job: FrontWrite) -> Result<Option<usize>, String> {
     let _profile = crate::load_profile::span(profile, "front-record-write", name);
     // Keep code/old parts, even if the boot record was rejected. Cache::open decides
     // staleness after loading; an early write must not retire still-linkable code.
-    Spill { dir, files: vec![(path.clone(), false, entries)], marks }.write_locked(&guard, &late)?;
+    Spill { dir, files: vec![(path.clone(), false, entries)], shared: Vec::new(), marks }.write_locked(&guard, &late)?;
     Ok(recorded.then_some(ci))
 }
 
@@ -8851,6 +9038,141 @@ mod data_tests {
         std::fs::rename(&a, &a2).unwrap();
         assert_eq!(run(&mut ua2, &a2_ids, a2_path, &a2, fresh, home), (first, [6, 0, 0, 1, 1]), "the moved checkout links only the shared code");
         drop((ua, ub, ub2, ua2));
+        std::fs::remove_dir_all(top).unwrap();
+    }
+
+    /// A shared store's ledger is merged with the one on disk under the store's lock (SharedMerge,
+    /// store::append_ledgered). The merge alone: a disk entry of a crate this program lacks is kept,
+    /// one of a crate it has with another value refuses the batch, and so does an included file
+    /// under a checkout (a registry file does not). Then checkouts a and b (DEP_MODE=one) and c
+    /// (DEP_MODE=two) over one shared store, dep reading DEP_MODE and a file of its own: b links
+    /// a's dep code and dep's borrowck verdict and records none of it; c neither uses nor changes
+    /// the store (its dep code and verdict are its own) and a hits after it as before; and a and c
+    /// writing in turn after both validated an empty store: c's batch is refused and lands in c's
+    /// own store, where c's next run finds it, while a's next run links the shared code.
+    #[test]
+    fn shared_stores_share_code_whose_late_inputs_agree() {
+        isolated_test!(shared_stores_share_code_whose_late_inputs_agree);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let top = std::env::temp_dir().join(format!("relax-shared-ledger-{}", std::process::id()));
+        let (cargo, std_dir) = (top.join("cargo"), top.join("std"));
+        let registry = cargo.join("registry/src/index");
+        let write = |path: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let note = registry.join("dep-1.0.0/src/note.txt");
+        write(&registry.join("dep-1.0.0/src/lib.rs"), "#![no_std] pub fn mode() -> &'static str { env!(\"DEP_MODE\") } pub fn note() -> &'static str { include_str!(\"note.txt\") } pub fn twice(x: u32) -> u32 { x * 2 }");
+        write(&note, "a note");
+        let note = note.to_str().unwrap().to_string();
+        let (env, file) = (crate::sip::LATE_ENV, crate::sip::LATE_FILE);
+        let (one, two) = (crate::sip::late_hash(Some(b"one")), crate::sip::late_hash(Some(b"two")));
+
+        // the merge alone
+        let (dep_id, lacked) = (ident_hex(1), ident_hex(7));
+        let merge = |run: Vec<(String, u8, String, u128)>, value: u128| SharedMerge {
+            run,
+            names: [(dep_id.clone(), "dep".to_string())].into_iter().collect(),
+            late: [(("dep".to_string(), env, "DEP_MODE".to_string()), value)].into_iter().collect(),
+            machine: vec![cargo.to_str().unwrap().to_string(), std_dir.to_str().unwrap().to_string()],
+            verbose: false,
+        };
+        let disk = encode_ledger([(lacked.clone(), env, "S_MODE".to_string(), one), (dep_id.clone(), env, "DEP_MODE".to_string(), one)].iter());
+        let merged = merge(vec![(dep_id.clone(), env, "DEP_MODE".to_string(), one), (dep_id.clone(), file, note.clone(), crate::sip::late_hash(Some(b"a note")))], one).merge(Some(&disk));
+        let merged = decode_ledger(&merged.expect("equal values merge")).unwrap();
+        assert!(merged.iter().any(|e| e.0 == lacked), "a crate this program lacks keeps its ledger entries");
+        assert!(merged.iter().any(|e| e.2 == note), "this run's inputs the disk lacks are added (a file of the registry is a shared input)");
+        assert!(merge(vec![(dep_id.clone(), env, "DEP_MODE".to_string(), two)], two).merge(Some(&disk)).is_none(), "another value of an input on disk refuses the batch");
+        let inside = top.join("a/data.txt").to_str().unwrap().to_string();
+        assert!(merge(vec![(dep_id.clone(), file, inside, one)], one).merge(None).is_none(), "an included file under a checkout refuses the batch");
+
+        // three checkouts over one shared store
+        let app = "#![no_std] pub fn main() -> u32 { dep::mode(); dep::note(); dep::twice(1) }";
+        let (a, b, c) = (top.join("a"), top.join("b"), top.join("c"));
+        for ws in [&a, &b, &c] {
+            write(&ws.join("src/lib.rs"), app);
+        }
+        // a process's late inputs as dep's expansion notes them, DEP_MODE = `mode`
+        let inputs = |mode: &str| {
+            // Safety: no other thread of this test reads or notes late inputs
+            unsafe { relax_session::reset_statics() };
+            crate::crates::set_crate_env("dep", vec![("DEP_MODE".to_string(), mode.to_string())]);
+            crate::sip::note_late_input("dep", env, "DEP_MODE", Some(mode.as_bytes()));
+            crate::sip::note_late_input("dep", file, &note, Some(b"a note"));
+        };
+        let load = |ws: &std::path::Path, mode: &str| {
+            inputs(mode);
+            let mut prog = crate::program::Program::new(&session);
+            let d = prog.load_crate("dep", registry.join("dep-1.0.0/src/lib.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+            let deps = vec![(prog.syms.intern("dep"), d)];
+            prog.load_crate("app", ws.join("src/lib.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), deps).unwrap();
+            let mut tcx = crate::tcx::Tcx::new();
+            tcx.collect(&prog);
+            let u = Unit::new(prog, tcx, 0);
+            let def = |krate: &str, name: &str| (0..u.prog.defs.len() as u32).map(DefId).find(|&x| u.prog.syms.str(u.prog.crates[u.prog.def(x).krate as usize].name) == krate && u.prog.name(x) == name).unwrap();
+            let ids = [("dep", "mode"), ("dep", "note"), ("dep", "twice"), ("app", "main")].map(|(k, n)| u.fn_id(FnKey::Inst(def(k, n), vec![])));
+            (u, ids)
+        };
+        // every unit made before any runs (a unit's drop stops the key queries of later ones)
+        let (mut ua, a_ids) = load(&a, "one");
+        let (mut ub, b_ids) = load(&b, "one");
+        let (mut uc, c_ids) = load(&c, "two");
+        let open = |u: &Unit, ws: &std::path::Path, dir: &str, shared: &std::path::Path| {
+            let mut from = OpenFrom::of(u);
+            from.anchors = Some(crate::dirs::Anchors::of(&[
+                ("run", ws.join(dir).to_str().unwrap()), ("cargo", cargo.to_str().unwrap()), ("ws", ws.to_str().unwrap()),
+            ], std_dir.to_str().unwrap()));
+            from.shared = Some(SharedCode { dir: shared.to_path_buf(), write: true });
+            let mut cache = Cache::open_from(&from, Mode::ReadOnly, ws.join(dir), None).unwrap();
+            cache.mode = Mode::On;
+            cache
+        };
+        // the slots' lookups (a miss is recorded) and dep::twice's borrowck verdict (found, or recorded)
+        let fill = |cache: &mut Cache, u: &mut Unit, ids: &[u32; 4]| -> ([bool; 4], bool) {
+            let hit = ids.map(|id| cache.lookup(u, id).is_some());
+            for (&id, hit) in ids.iter().zip(hit) {
+                if !hit { cache.record(u, id, &[0xc3], &[], &[]); }
+            }
+            let vk = cache.borrowck_key(u, ids[2]).unwrap();
+            let verdict = cache.borrowck_stored(vk).is_some();
+            if !verdict { cache.record_borrowck(vk, StoredVerdict::Clean); }
+            (hit, verdict)
+        };
+        // one run: hits, verdict found, [shared records, shared hits, kept out]
+        let run = |u: &mut Unit, ids: &[u32; 4], ws: &std::path::Path, mode: &str, dir: &str, shared: &std::path::Path| {
+            inputs(mode);
+            let mut cache = open(u, ws, dir, shared);
+            let (hit, verdict) = fill(&mut cache, u, ids);
+            cache.flush().unwrap();
+            let st = &cache.stats;
+            (hit, verdict, [st.shared_records, st.shared_hits, st.shared_kept_out])
+        };
+        let home = top.join("home/code");
+        let own = "target/relax";
+        assert_eq!(run(&mut ua, &a_ids, &a, "one", own, &home), ([false; 4], false, [3, 0, 0]), "a's first run shares dep's three fns");
+        assert_eq!(run(&mut ub, &b_ids, &b, "one", own, &home), ([true, true, true, false], true, [0, 3, 0]), "b links dep's code and verdict from the shared store and records none of it");
+        assert_eq!(run(&mut uc, &c_ids, &c, "two", own, &home), ([false; 4], false, [0, 0, 0]), "c, with another DEP_MODE, neither reads the shared store nor writes it");
+        assert_eq!(run(&mut ua, &a_ids, &a, "one", own, &home), ([true; 4], true, [0, 3, 0]), "a hits the shared code after c as before");
+        // a and c both open an empty shared store, then write in turn
+        let (home2, fresh) = (top.join("home2/code"), "target/relax-turns");
+        inputs("one");
+        let mut ca = open(&ua, &a, fresh, &home2);
+        fill(&mut ca, &mut ua, &a_ids);
+        inputs("two");
+        let mut cc = open(&uc, &c, fresh, &home2);
+        fill(&mut cc, &mut uc, &c_ids);
+        inputs("one");
+        ca.flush().unwrap();
+        inputs("two");
+        cc.flush().unwrap();
+        assert_eq!((ca.stats.shared_records, ca.stats.shared_kept_out, cc.stats.shared_kept_out), (3, 0, 3), "the second writer, with another DEP_MODE, is refused: its dep code goes to its own store");
+        drop((ca, cc));
+        assert_eq!(run(&mut ua, &a_ids, &a, "one", fresh, &home2), ([true; 4], true, [0, 3, 0]), "a links the shared code the first writer left");
+        assert_eq!(run(&mut uc, &c_ids, &c, "two", fresh, &home2), ([true; 4], true, [0, 0, 0]), "c finds its refused batch in its own store");
+        drop((ua, ub, uc));
         std::fs::remove_dir_all(top).unwrap();
     }
 
