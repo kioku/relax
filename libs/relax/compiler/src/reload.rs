@@ -3793,8 +3793,8 @@ fn fresh_layout_struct(u: &Unit, d: DefId, versions: &[(crate::program::FileVers
 /// Live sessions (M10), for a struct that takes its new layout (fresh_layout_struct; `s`: it and
 /// the ADTs holding it, holding_adts): where a running value of it may be, as the restart's reason.
 /// A static or thread-local the run knows (placed, or with its place reserved) whose type can hold
-/// one; a trait object made from a type that can (its vtable, made this run: the object may be
-/// alive); a static of a crate that can name it (`visible`) whose value was computed from its
+/// one; a trait object made from a type that can (its vtable, made this run or by the stored code
+/// this run linked: the object may be alive); a static of a crate that can name it (`visible`) whose value was computed from its
 /// layout (value_reads_layout: it is not evaluated again).
 /// Values behind pointers converted to other types, and frames, are asked apart (raw_builder; the
 /// frames at the install). None: no running value of it is left.
@@ -3812,8 +3812,16 @@ fn no_live_values(u: &Unit, d: DefId, s: &[DefId], visible: &[bool]) -> Option<S
             return Some(format!("struct `{}` changed its layout, and `{}` may hold values of it in the old one -- restart the app", name, u.prog.def_path(n)));
         }
     }
-    if let Some((src, _)) = u.vtables.snapshot().into_iter().map(|(k, _)| k).find(|(src, _)| held(*src)) {
+    let lowered = u.vtables.snapshot();
+    if let Some(&(src, _)) = lowered.keys().find(|(src, _)| held(*src)) {
         return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, crate::typeck::type_name(&u.prog, &u.tcx, src)));
+    }
+    // the vtables of code linked from the disk cache or placed from the startup image are not in
+    // Unit::vtables: the code each one holds says whose it is (a warm session took a struct's
+    // new layout while a trait object the stored code made held a value of it, 11-14)
+    let lowered: crate::fxhash::HashSet<u64> = lowered.values().copied().collect();
+    if let Some((_, n)) = u.syms.vtable_objs().into_iter().find(|(a, _)| !lowered.contains(a) && stored_vtable_holds(u, *a, s)) {
+        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, vtable_name_types(&n).map_or_else(|| n.clone(), |t| t.0)));
     }
     // a static is evaluated once: a value computed from the old layout (`size_of`) stays
     // (in the crates that can name it: `visible`)
@@ -3824,6 +3832,33 @@ fn no_live_values(u: &Unit, d: DefId, s: &[DefId], visible: &[bool]) -> Option<S
         return Some(format!("struct `{}` changed its layout, and the value of `{}` was computed from the old one{} -- restart the app", name, u.prog.def_path(st), via));
     }
     None
+}
+
+/// Live sessions (M10): whether the vtable at `a`, one this run did not lower (linked from the
+/// disk cache, placed from the startup image), is of a type that can hold a value of one of the
+/// ADTs `s` (ty_holds), as the code it holds shows (syms::data_thunks: its entries and its
+/// supertraits'): the drop glue's type, a method instance's generic arguments and receiver, a
+/// shim's arguments (the closure type of a call through `dyn FnOnce`), and for a closure's body
+/// its owner's generic arguments. A slot whose identity did not decode says nothing.
+fn stored_vtable_holds(u: &Unit, a: u64, s: &[DefId]) -> bool {
+    let held = |t: &TyId| ty_holds(u, *t, s, 0);
+    let mut thunks = Vec::new();
+    crate::syms::data_thunks(u, a, &mut thunks);
+    thunks.into_iter().any(|mut sl| {
+        let mut owner = false;
+        loop {
+            match &u.fns[sl as usize].key {
+                FnKey::Closure(_, _, p) => {
+                    owner = true;
+                    sl = *p;
+                }
+                FnKey::Sandbox(p) | FnKey::Plain(p) => sl = *p,
+                FnKey::Inst(f, args) => break args.iter().any(held) || !owner && u.tcx.fn_sig(&u.prog, *f).is_some_and(|g| g.params.first().is_some_and(held)),
+                FnKey::Glue(k, t) => break *k != crate::jit::GLUE_UNNAMED && held(t),
+                FnKey::Shim(sh) => break sh.args.iter().any(held),
+            }
+        }
+    })
 }
 
 /// Live sessions (M10): whether the value of constant or static `c` was computed from the layout
