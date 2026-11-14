@@ -887,9 +887,6 @@ impl<'a> Drop for SetLenOnDrop<'a> {
 }
 
 unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A> {
-    // small, as before the allocator parameter (the guard naming it took the source past O1's
-    // size rule): every Vec's drop is inlined where the Vec dies, so its loops scalarise early
-    #[inline]
     fn drop(&mut self) {
         // library/alloc/src/vec/mod.rs: Vec::drop leaves deallocation to RawVec's
         // field drop, including on unwind. A zero-sized layout has no allocation.
