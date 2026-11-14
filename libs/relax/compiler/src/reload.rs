@@ -2655,6 +2655,123 @@ fn vtable_types(name: &str) -> String {
     }
 }
 
+/// A trait object's type as a person reads it in a restart's reason, in the program's own terms:
+/// a closure (or async block) by the fn that defines it and where it is, any other type by its
+/// path, in backquotes. Another crate's closure or type (std's thread start, an iterator adapter)
+/// that holds one of the program's own is named by that one, then by itself: `the closure in
+/// `app::main` at src/main.rs:12:24, passed to `std::thread::Builder::spawn_unchecked_``.
+fn object_type_name(u: &Unit, t: TyId) -> String {
+    use crate::types::TyKind::*;
+    match u.tcx.tys.kind(t).clone() {
+        Closure(file, e, c) => {
+            let owner = closure_owner(u, c.parent_args);
+            closure_desc(u, file, e, owner.as_ref().map(|(d, args)| (*d, &args[..])), Some(c.tupled_upvars_ty))
+        }
+        Adt(d, args, _) if !own_def(u, d) => match u.tcx.tys.list(args).iter().find_map(|x| own_part(u, *x, 1)) {
+            Some(inner) => format!("{}, inside `{}`", inner, crate::typeck::item_path(&u.prog, &u.tcx, d)),
+            None => format!("`{}`", crate::typeck::type_name(&u.prog, &u.tcx, t)),
+        },
+        _ => format!("`{}`", crate::typeck::type_name(&u.prog, &u.tcx, t)),
+    }
+}
+
+/// Whether `d` is of the program's own crates (the run's app crates: CrateInfo::validate).
+fn own_def(u: &Unit, d: DefId) -> bool {
+    u.prog.crates.get(u.prog.def(d).krate as usize).is_some_and(|c| c.validate)
+}
+
+/// A closure type's defining fn and its instance's generic arguments (its `parent_args`).
+fn closure_owner(u: &Unit, parent_args: TyId) -> Option<(DefId, Vec<TyId>)> {
+    match u.tcx.tys.kind(parent_args) {
+        crate::types::TyKind::FnDef(d, args, _) => Some((*d, u.tcx.tys.list(*args).to_vec())),
+        _ => None,
+    }
+}
+
+/// Closure `e` of `file` (`owner` its defining fn with its instance's arguments, `upvars` what
+/// it captures) in the program's own terms (object_type_name): a closure of another crate's fn
+/// that holds one of the program's is named by that one, then as passed to its fn.
+fn closure_desc(u: &Unit, file: u32, e: u32, owner: Option<(DefId, &[TyId])>, upvars: Option<TyId>) -> String {
+    if let Some((d, args)) = owner.filter(|(d, _)| !own_def(u, *d)) {
+        if let Some(inner) = args.iter().copied().chain(upvars).find_map(|x| own_part(u, x, 1)) {
+            return format!("{}, passed to `{}`", inner, crate::typeck::item_path(&u.prog, &u.tcx, d));
+        }
+    }
+    closure_name(u, file, e, owner)
+}
+
+/// The program's own closure or type `t` is or holds, the outermost first (another crate's
+/// wrappers peeled), named as object_type_name names it. None: it holds none.
+fn own_part(u: &Unit, t: TyId, depth: u32) -> Option<String> {
+    use crate::types::TyKind::*;
+    if depth > 16 {
+        return None;
+    }
+    let tys = &u.tcx.tys;
+    let first = |l: crate::types::TyList| tys.list(l).iter().find_map(|x| own_part(u, *x, depth + 1));
+    match tys.kind(t).clone() {
+        Closure(file, e, c) => {
+            let owner = closure_owner(u, c.parent_args);
+            match &owner {
+                Some((d, args)) if own_def(u, *d) => Some(closure_name(u, file, e, Some((*d, &args[..])))),
+                _ => owner.iter().flat_map(|(_, args)| args.iter().copied()).chain([c.tupled_upvars_ty]).find_map(|x| own_part(u, x, depth + 1)),
+            }
+        }
+        Adt(d, args, _) => {
+            if own_def(u, d) {
+                Some(format!("`{}`", crate::typeck::type_name(&u.prog, &u.tcx, t)))
+            } else {
+                first(args)
+            }
+        }
+        Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => own_part(u, x, depth + 1),
+        Tuple(v) => first(v),
+        FnDef(_, args, _) => first(args),
+        _ => None,
+    }
+}
+
+/// Closure (or async block) `e` of `file` as a person reads it: `the closure in `f` at
+/// src/a.rs:12:9`, `f` its defining fn (with the generic arguments its instance has).
+fn closure_name(u: &Unit, file: u32, e: u32, owner: Option<(DefId, &[TyId])>) -> String {
+    let in_fn = owner.map_or_else(String::new, |(d, args)| {
+        let args = if args.is_empty() { String::new() } else { format!("::<{}>", args.iter().map(|a| crate::typeck::type_name(&u.prog, &u.tcx, *a)).collect::<Vec<_>>().join(", ")) };
+        format!(" in `{}{}`", crate::typeck::item_path(&u.prog, &u.tcx, d), args)
+    });
+    // an async fn's body is named by its fn's place
+    if e & crate::tcx::ASYNC_FN_BODY != 0 {
+        let at = owner.map_or_else(|| "source position unknown".to_string(), |(d, _)| {
+            let def = u.prog.def(d);
+            u.pos_str(def.file, u.prog.files[def.file as usize].ast.item(def.item).lo)
+        });
+        return format!("the body{} at {}", in_fn, at);
+    }
+    let x = u.prog.files.get(file as usize).filter(|f| f.ast.has_expr(crate::ast::ExprId(e))).map(|f| f.ast.expr(crate::ast::ExprId(e)));
+    let what = if x.is_some_and(|x| matches!(x.kind, crate::ast::ExprKind::Async(..))) { "the async block" } else { "the closure" };
+    let at = x.map_or_else(|| "source position unknown".to_string(), |x| u.pos_str(file, x.lo));
+    format!("{}{} at {}", what, in_fn, at)
+}
+
+/// The type of the trait objects of vtable `a` (one this run did not lower) as a person reads it
+/// (object_type_name), from the code it holds: its drop glue's type, else a closure's body or a
+/// shim over a closure. None when its code does not say (the data name's type then).
+fn stored_vtable_type_name(u: &Unit, a: u64) -> Option<String> {
+    let mut thunks = Vec::new();
+    crate::syms::data_thunks(u, a, &mut thunks);
+    let keys = || thunks.iter().map(|&s| &u.fns[s as usize].key);
+    if let Some(t) = keys().find_map(|k| match k {
+        FnKey::Glue(crate::jit::GLUE_DROP, t) => Some(*t),
+        _ => None,
+    }) {
+        return Some(object_type_name(u, t));
+    }
+    keys().find_map(|k| match k {
+        FnKey::Closure(file, e, p) => Some(closure_desc(u, *file, *e, slot_instance(u, *p), None)),
+        FnKey::Shim(sh) => sh.args.iter().find(|t| matches!(u.tcx.tys.kind(**t), crate::types::TyKind::Closure(..))).map(|t| object_type_name(u, *t)),
+        _ => None,
+    })
+}
+
 /// A fn of a trait impl that stays (not in `removed`): its impl and the trait's item it implements.
 fn override_of(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, d: DefId, removed: &[DefId]) -> Option<(DefId, DefId)> {
     let def = prog.def(d);
@@ -3844,14 +3961,15 @@ fn no_live_values(u: &Unit, d: DefId, s: &[DefId], visible: &[bool]) -> Option<S
     }
     let lowered = u.vtables.snapshot();
     if let Some(&(src, _)) = lowered.keys().find(|(src, _)| held(*src)) {
-        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, crate::typeck::type_name(&u.prog, &u.tcx, src)));
+        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of {}, which may hold values of it in the old one -- restart the app", name, object_type_name(u, src)));
     }
     // the vtables of code linked from the disk cache or placed from the startup image are not in
     // Unit::vtables: the code each one holds says whose it is (a warm session took a struct's
     // new layout while a trait object the stored code made held a value of it, 11-14)
     let lowered: crate::fxhash::HashSet<u64> = lowered.values().copied().collect();
-    if let Some((_, n)) = u.syms.vtable_objs().into_iter().find(|(a, _)| !lowered.contains(a) && stored_vtable_holds(u, *a, s)) {
-        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of `{}`, which may hold values of it in the old one -- restart the app", name, vtable_name_types(&n).map_or_else(|| n.clone(), |t| t.0)));
+    if let Some((a, n)) = u.syms.vtable_objs().into_iter().find(|(a, _)| !lowered.contains(a) && stored_vtable_holds(u, *a, s)) {
+        let of = stored_vtable_type_name(u, a).unwrap_or_else(|| format!("`{}`", vtable_name_types(&n).map_or_else(|| n.clone(), |t| t.0)));
+        return Some(format!("struct `{}` changed its layout, and the running code made trait objects of {}, which may hold values of it in the old one -- restart the app", name, of));
     }
     // a static is evaluated once: a value computed from the old layout (`size_of`) stays
     // (in the crates that can name it: `visible`)
