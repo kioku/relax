@@ -375,7 +375,7 @@ fn deep_text(prog: &Program, c: u32, texts: &[u128]) -> u128 {
 
 /// The current value of a late input (as the front validates its images: cache.rs).
 pub(crate) fn late_now(c: &str, kind: u8, name: &str) -> u128 {
-    let content = if crate::sip::late_base(kind) == crate::sip::LATE_FILE { crate::vfs::read(name).ok() } else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
+    let content = crate::crates::late_value_now(c, kind, name);
     crate::sip::late_hash(content.as_deref())
 }
 

@@ -142,6 +142,11 @@ pub fn hash_bytes(b: &[u8]) -> u128 {
 /// re-checks them before trusting the world (C3).
 pub const LATE_FILE: u8 = 1;
 pub const LATE_ENV: u8 = 2;
+/// A proc macro's read of cargo's `[env]` configuration for the crate invoking it
+/// (macro_reg::call_krate_env, past the crate's own variables): present or absent, compared with
+/// that configuration alone (a confined macro never sees the process environment, as env!'s
+/// LATE_ENV value can fall through to).
+pub const LATE_CONFIG_ENV: u8 = 3;
 /// Or'ed into a late input's kind when read while parsing a hole body: a fn body that is not
 /// const, not async and returns no `impl Trait`; no other crate's check sees it.
 pub const LATE_HOLE: u8 = 0x80;
@@ -150,8 +155,13 @@ pub const LATE_HOLE: u8 = 0x80;
 /// crate's check sees the input through that text, not through the input.
 pub const LATE_ITEMS: u8 = 0x40;
 
-/// A late input's kind without its position bits: LATE_FILE or LATE_ENV.
+/// A late input's kind without its position bits: LATE_FILE, LATE_ENV or LATE_CONFIG_ENV.
 pub fn late_base(kind: u8) -> u8 { kind & !(LATE_HOLE | LATE_ITEMS) }
+
+/// A late input's kind as a word: `file`, `env` or `config env`.
+pub fn late_kind_name(kind: u8) -> &'static str {
+    match late_base(kind) { LATE_FILE => "file", LATE_CONFIG_ENV => "config env", _ => "env" }
+}
 
 /// Whether a late input of a checked dependency can change another crate's check by its value
 /// (read in an expression of the dependency's interface: a const, a const fn's body, an array length).

@@ -5292,13 +5292,9 @@ fn ledger_current(p: &Store, present: &HashSet<String>, memo: &mut HashMap<(u8, 
     ledger_current_named(p, &|c| present.contains(c).then(|| c.to_string()), memo)
 }
 
-/// The value a late input has now: an included file's contents or crate `c`'s environment variable.
+/// The content hash a late input has now (crates::late_value_now).
 fn late_now(c: &str, k: u8, name: &str) -> u128 {
-    if crate::sip::late_base(k) == crate::sip::LATE_FILE {
-        crate::sip::late_hash(crate::vfs::read(name).ok().as_deref())
-    } else {
-        crate::sip::late_hash(crate::crates::crate_env_named(c, name).as_deref().map(|s| s.as_bytes()))
-    }
+    crate::sip::late_hash(crate::crates::late_value_now(c, k, name).as_deref())
 }
 
 /// A ledger's entries: (crate, kind, name, content hash); None: it does not decode.
@@ -5335,7 +5331,7 @@ fn ledger_current_named(p: &Store, name_of: &dyn Fn(&str) -> Option<String>, mem
         let now = *memo.entry((k, c.to_string(), name.to_string())).or_insert_with(|| late_now(c, k, name));
         if now != h {
             if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-                eprintln!("relax cache: stale code store: crate {c}: late input {} `{name}` changed (stored {h:032x}, now {now:032x})", if crate::sip::late_base(k) == crate::sip::LATE_FILE { "file" } else { "env" });
+                eprintln!("relax cache: stale code store: crate {c}: late input {} `{name}` changed (stored {h:032x}, now {now:032x})", crate::sip::late_kind_name(k));
             }
             return false;
         }
@@ -7326,9 +7322,7 @@ impl crate::crate_image::CrateImages for FrontImages {
             return None;
         }
         let late = image.late_inputs.iter().map(|(c, kind, name, hash)| {
-            let content = if crate::sip::late_base(*kind) == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
-                else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
-            (c, *kind, name, *hash, content)
+            (c, *kind, name, *hash, crate::crates::late_value_now(c, *kind, name))
         }).collect::<Vec<_>>();
         if late.iter().any(|(_, _, _, hash, content)| crate::sip::late_hash(content.as_deref()) != *hash) {
             if crate::preload::trace() { eprintln!("boot-trace: context demand image: late input changed"); }
@@ -7393,9 +7387,7 @@ impl crate::crate_image::CrateImages for FrontImages {
                 return None;
             }
             let late = part.late_inputs.iter().map(|(c, kind, name, hash)| {
-                let content = if crate::sip::late_base(*kind) == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
-                    else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
-                (c, *kind, name, *hash, content)
+                (c, *kind, name, *hash, crate::crates::late_value_now(c, *kind, name))
             }).collect::<Vec<_>>();
             if let Some((_, kind, name, _, _)) = late.iter().find(|(_, _, _, hash, content)| crate::sip::late_hash(content.as_deref()) != *hash) {
                 if profile { eprintln!("rust-demand-part-invalid: {} late {kind} {name}", c.name); }
@@ -7469,8 +7461,7 @@ fn replay_front_ledger(st: &Store) -> Option<()> {
         let k = d.u8()?;
         let name = d.str()?;
         let _hash = d.u128()?;
-        let content = if crate::sip::late_base(k) == crate::sip::LATE_FILE { crate::vfs::read(name).ok() } else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
-        crate::sip::note_late_input(c, k, name, content.as_deref());
+        crate::sip::note_late_input(c, k, name, crate::crates::late_value_now(c, k, name).as_deref());
     }
     Some(())
 }
@@ -8975,6 +8966,53 @@ mod data_tests {
         assert_ne!(open.3, sandboxed.3, "so are the check verdicts' keys");
         assert!(run(Policy::Open).0, "Open's own code hits");
         assert!(run(Policy::Sandboxed).0, "Sandboxed's own code hits");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A proc macro's read of cargo's `[env]` (macro_reg::call_krate_env past the crate's own
+    /// variables) is a late input of the invoking crate (sip LATE_CONFIG_ENV), present or absent:
+    /// the crate's code store is stale when that configuration's value changes, and not when only
+    /// the process environment has the variable (a confined macro never sees it). Each run is one
+    /// program over the same cache, its macro's read made as a confined expansion makes it.
+    #[test]
+    fn a_macros_read_of_cargos_env_config_checks_its_crates_store() {
+        isolated_test!(a_macros_read_of_cargos_env_config_checks_its_crates_store);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-config-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("s.rs"), "#![no_std] pub fn own() -> u32 { 1 }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("s", dir.join("s.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let own = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == "own").unwrap();
+        let id = u.fn_id(FnKey::Inst(own, vec![]));
+        const K: &str = "RELAX_CONFIG_ENV_TEST_K";
+        // one run with `[env]` K = `config`: whether s::own hit (a miss is recorded)
+        let mut run = |config: Option<&str>| -> bool {
+            // Safety: no other thread of this test reads or notes late inputs
+            unsafe { relax_session::reset_statics() };
+            crate::crates::set_config_env(config.map(|v| (K.to_string(), v.to_string())).into_iter().collect());
+            let call = crate::macro_reg::with_call_krate("s");
+            assert_eq!(crate::macro_reg::call_krate_env(K).as_deref(), config, "the macro reads [env]'s value");
+            drop(call);
+            let mut cache = open_test_cache(&u, &dir.join("cache"));
+            let hit = cache.lookup(&mut u, id).is_some();
+            if !hit { cache.record(&u, id, &[0xc3], &[], &[]); }
+            cache.flush().unwrap();
+            hit
+        };
+        assert!(!run(Some("one")), "a cold cache");
+        assert!(run(Some("one")), "the same [env] value: s's store holds");
+        assert!(!run(Some("two")), "another [env] value: s's store is stale");
+        assert!(!run(None), "K gone from [env]: stale again (an absent read is noted too)");
+        // (this test's process is this test alone: isolated_test)
+        std::env::set_var(K, "from the shell");
+        assert!(run(None), "the process environment is not an input of a confined macro");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

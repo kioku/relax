@@ -620,6 +620,17 @@ pub fn config_env_value(key: &str) -> Option<String> {
     CONFIG_ENV.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
+/// The value late input `name` of crate `krate` (sip LATE_*, kind `kind`) has now: an included
+/// file's contents, an `env!` value (crate_env_named), or cargo's `[env]` value a proc macro read
+/// (config_env_value alone).
+pub fn late_value_now(krate: &str, kind: u8, name: &str) -> Option<Vec<u8>> {
+    match crate::sip::late_base(kind) {
+        crate::sip::LATE_FILE => crate::vfs::read(name).ok(),
+        crate::sip::LATE_CONFIG_ENV => config_env_value(name).map(String::into_bytes),
+        _ => crate_env_named(krate, name).map(String::into_bytes),
+    }
+}
+
 /// Value of `env!(key)` / `option_env!(key)` in crate `krate`. The process environment is the one
 /// the run was started with: a variable the run set for its program (set_program_env) reads as it
 /// was before, as rustc never sees the run-time variables of the target cargo runs.

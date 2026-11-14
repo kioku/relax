@@ -5038,7 +5038,7 @@ fn summary_inner(why: &str) {
     if why != "stats" && std::env::var_os("RELAX_CACHE_FP").is_some() {
         let late = crate::sip::late_inputs();
         for (c, k, n, h) in &late {
-            verbose!("relax cache: late {} {}{} {} {:032x}", c, if crate::sip::late_base(*k) == crate::sip::LATE_FILE { "file" } else { "env" }, if *k & crate::sip::LATE_HOLE != 0 { " body" } else if *k & crate::sip::LATE_ITEMS != 0 { " items" } else { "" }, n, h);
+            verbose!("relax cache: late {} {}{} {} {:032x}", c, crate::sip::late_kind_name(*k), if *k & crate::sip::LATE_HOLE != 0 { " body" } else if *k & crate::sip::LATE_ITEMS != 0 { " items" } else { "" }, n, h);
         }
         verbose!("relax cache: {} late inputs", late.len());
     }

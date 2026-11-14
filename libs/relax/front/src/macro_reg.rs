@@ -356,7 +356,13 @@ pub fn call_krate_env(key: &str) -> Option<String> {
             _ => None,
         }
     });
-    own.or_else(|| crate::crates::config_env_value(key))
+    own.or_else(|| {
+        // cargo's `[env]`: a checkout's configuration, in no key; noted as the crate's late input
+        // (present or absent: another checkout may set it), checked by its stores' ledgers
+        let v = crate::crates::config_env_value(key);
+        crate::sip::note_late_input(&krate, crate::sip::LATE_CONFIG_ENV, key, v.as_deref().map(|x| x.as_bytes()));
+        v
+    })
 }
 
 /// The registry and the stats are process-wide: files parse on worker threads too.
