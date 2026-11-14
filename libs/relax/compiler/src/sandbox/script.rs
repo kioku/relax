@@ -386,10 +386,11 @@ mod files {
         events: i16,
         revents: i16,
     }
-    #[cfg(target_vendor = "apple")]
-    type NfdsT = u32;
-    #[cfg(not(target_vendor = "apple"))]
+    // nfds_t: glibc's unsigned long, bionic's and Apple's unsigned int (as tui.rs declares poll)
+    #[cfg(target_os = "linux")]
     type NfdsT = u64;
+    #[cfg(not(target_os = "linux"))]
+    type NfdsT = u32;
     #[cfg(target_vendor = "apple")]
     type ModeT = u16;
     #[cfg(not(target_vendor = "apple"))]
