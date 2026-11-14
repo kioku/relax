@@ -356,6 +356,8 @@ fn test_page(st: &Style) -> String {
     p.text(&format!("Each run prints testverdict; {tool} inspect <pid> watch on=testverdict follows its JSON verdicts.", tool = command()));
     p.text(&format!("Each test's outcome, and whether it ran for that edit: {tool} inspect <pid> test-results group=<verdict group> --json.", tool = command()));
     p.text("Hot-load failures restart the test process; only the replacement tests give a verdict.");
+    p.text("A run whose patched code faulted says faulted=[groups]: no pass of the edit. The JIT undoes those patches and runs again;");
+    p.text("that run says reverted=[groups]: it tested the code from before the edit, not the saved source.");
     p.out
 }
 

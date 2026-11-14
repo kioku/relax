@@ -3320,14 +3320,17 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
 /// same, just below them (wrapping). repr(int), repr(C) and generic enums get (a) only: their
 /// tags are their discriminants by contract, or not every instance is laid out to be checked.
 /// A placement is taken when, over every type this process laid out that holds the enum by value
-/// (enum_reach): (i) values made before the edit read the same: each layout is the one they
+/// (enum_reach; the types the code from the disk cache holds it in were laid out before the
+/// commit: lay_out_stored_holders): (i) values made before the edit read the same: each layout is the one they
 /// were made with but for a wider valid range, and the enum's own instances may gain variants,
 /// the running ones keeping their tags and fields; and (ii) each layout has the size,
 /// alignment, offsets and number of spare values rustc gives the new text, so the program's own
 /// `size_of` asserts hold. None taken: an enum no running value of is left (`new_layout`:
 /// fresh_layout_enum, no_live_values) takes (a), with a note, and its users are rebuilt;
-/// otherwise Err, the restart reason naming the type (a) changed.
-fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running: &[u128], after: &[u128], new_layout: bool) -> Result<(crate::tcx::AdtT, Option<String>), String> {
+/// otherwise Err, the restart reason naming the type (a) changed. `unchecked`: a type the code
+/// from the cache holds it in could not be laid out to check: no placement is taken but (a) for
+/// an enum no running value of is left.
+fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running: &[u128], after: &[u128], new_layout: bool, unchecked: Option<&str>) -> Result<(crate::tcx::AdtT, Option<String>), String> {
     let added = fresh.variants.iter().find(|v| !old.variants.iter().any(|o| o.name == v.name)).map(|v| v.name);
     if added.is_none() && running == after {
         return Ok((fresh.clone(), None));
@@ -3340,6 +3343,12 @@ fn enum_place(u: &mut Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx
     let restart = |why: &str| format!("enum `{name}`: {change}, and {why} -- restart the app");
     if u.prog.crates[u.prog.def(d).krate as usize].rustc_laid {
         return Err(restart("it is a provided crate's, whose values are rustc's bytes"));
+    }
+    if let Some(why) = unchecked {
+        return match new_layout {
+            true => Ok((fresh.clone(), Some(format!("enum `{name}` takes its new layout ({change}): no running value of it is left, and the code using it is rebuilt")))),
+            false => Err(restart(why)),
+        };
     }
     let at = match running_variants_at(old, fresh) {
         Ok(at) if running.len() == old.variants.len() && after.len() == fresh.variants.len() => at,
@@ -3466,6 +3475,91 @@ fn pinned_tags(old: &[u128], at: &[usize], n: usize, bytes: u32, signed: bool, b
 fn enum_reach(u: &Unit, d: DefId) -> Vec<(TyId, &'static crate::layout::Layout)> {
     let mut memo = crate::fxhash::HashMap::default();
     u.lay.laid_out().into_iter().filter(|(t, _)| holds_by_value(u, *t, d, &mut memo, 0)).collect()
+}
+
+/// Live sessions, before an enum edit's commit: lays out, with the running definitions, every
+/// type holding a value of enum `d` in its own bytes (holds_by_value) in the code this run did
+/// not build: linked from the disk cache or placed from the startup image (its CodeKind origin),
+/// or only inlined into such code. An earlier run built that code with these layouts and its
+/// values have them, but this run may never have laid them out, and enum_place checks a
+/// placement against the types this run laid out (enum_reach): a warm session gave a 1-byte enum
+/// a 24-byte layout, and std's channel code over it, linked from the cache, read the new values
+/// with the old one (a segfault in mpmc, 11-14). The types: each such slot's key's, and for a fn
+/// of a crate that can name `d` (`visible`) or an instance over a type that names it, its body's
+/// (type check of the running text) at the instance's arguments. Err: one that holds `d` cannot
+/// be laid out here (a closure whose captures this run never lowered, a coroutine's frame).
+fn lay_out_stored_holders(u: &Unit, d: DefId, visible: &[bool]) -> Result<(), String> {
+    use crate::jit::origin;
+    let tys = &u.tcx.tys;
+    let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+    let mut memo = crate::fxhash::HashMap::default();
+    let mut seen: crate::fxhash::HashSet<TyId> = Default::default();
+    // (each body's types once: its instances substitute their arguments)
+    let mut bodies: crate::fxhash::HashMap<DefId, Vec<TyId>> = Default::default();
+    let mut keys: Vec<(DefId, Vec<TyId>)> = Vec::new();
+    let mut types: Vec<TyId> = Vec::new();
+    {
+        let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+        let mut done: crate::fxhash::HashSet<u32> = Default::default();
+        for (i, f) in u.fns.iter().enumerate() {
+            let o = code.kind_of(f.code).origin;
+            if !(o == origin::CACHE || o == origin::IMAGE || (o == origin::UNKNOWN && !f.history().inlined_into.is_empty())) {
+                continue;
+            }
+            // a closure's body is checked with its owner's
+            let mut k = i as u32;
+            while let FnKey::Closure(_, _, p) | FnKey::Sandbox(p) | FnKey::Plain(p) = u.fns[k as usize].key {
+                k = p;
+            }
+            if !done.insert(k) {
+                continue;
+            }
+            match &u.fns[k as usize].key {
+                FnKey::Inst(fd, args) => {
+                    types.extend(args.iter().copied());
+                    let names = args.iter().any(|a| ty_holds(u, *a, &[d], 0));
+                    let krate = u.prog.def(*fd).krate as usize;
+                    if matches!(u.prog.def(*fd).kind, DefKind::Fn | DefKind::AssocFn) && def_is_bound(&u.prog, *fd) && !u.prog.crates[krate].rustc_laid && (names || visible.get(krate).copied().unwrap_or(true)) {
+                        keys.push((*fd, args.clone()));
+                    }
+                }
+                FnKey::Glue(_, t) => types.push(*t),
+                FnKey::Shim(sh) => types.extend(sh.args.iter().copied()),
+                _ => {}
+            }
+        }
+    }
+    if keys.is_empty() && types.is_empty() {
+        return Ok(());
+    }
+    for (fd, args) in keys {
+        let body = bodies.entry(fd).or_insert_with(|| {
+            let b = u.tcx.typeck(&u.prog, fd);
+            let mut v: Vec<TyId> = b.expr_ty.iter().chain(b.pat_ty.iter()).copied().collect();
+            v.sort_unstable_by_key(|t| t.0);
+            v.dedup();
+            v
+        });
+        types.extend(body.iter().map(|&t| tys.subst(t, &args)));
+    }
+    types.sort_unstable_by_key(|t| t.0);
+    types.dedup();
+    let probe = u.lay.probe();
+    for t in types {
+        let t = tys.erase_regions(u.tcx.try_normalize_erasing_regions(&u.prog, env, t).unwrap_or(t));
+        if !tys.is_concrete(t) || !seen.insert(t) || !holds_by_value(u, t, d, &mut memo, 0) {
+            continue;
+        }
+        // (laid out apart first: a closure this run never lowered is missing there, where the
+        // unit's layouts would derive its environment from the current text)
+        let lcx = crate::layout::LayoutCx::new(&u.prog);
+        probe.of(&lcx, &u.tcx, t);
+        if !lcx.missing.borrow().is_empty() {
+            return Err(format!("code from the disk cache holds its values in `{}`, which this run cannot lay out to check (a closure's captures or a coroutine's frame it never built)", crate::typeck::type_name(&u.prog, &u.tcx, t)));
+        }
+        u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t);
+    }
+    Ok(())
 }
 
 /// Whether a value of type `t` holds a value of ADT `d` in its own bytes: `d` itself, or a field
@@ -4718,6 +4812,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // what the running values (or the numbers and constants code read) cannot take: a restart
     // decided after the commit, where the edit's text is type-checked -- its errors refuse it
     let mut late_restart: Vec<String> = Vec::new();
+    // the enums a type the code from the disk cache holds their values in could not be laid out
+    // for (lay_out_stored_holders): why
+    let mut unchecked_reach: Vec<(DefId, String)> = Vec::new();
     for &d in &layout_defs {
         // an enum's matches see the new variants
         if u.prog.def(d).kind == DefKind::Enum {
@@ -4729,6 +4826,15 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             // running layout cannot take the edit (enum_place): its users are type-checked and
             // rebuilt with the edit, as a struct's that takes its new layout
             if fresh_layout_enum(u, d, &versions) {
+                // (what the code from the disk cache holds its values in, laid out while the
+                // running text is the program's: enum_place checks a placement against it)
+                let t = Instant::now();
+                if let Err(why) = lay_out_stored_holders(u, d, &visible_crates) {
+                    unchecked_reach.push((d, why));
+                }
+                if reload_trace() {
+                    eprintln!("reload-trace: the stored code's holders of `{}` laid out in {:.1} ms", def_name(&u.prog, d), t.elapsed().as_secs_f64() * 1e3);
+                }
                 let s = holding_adts(u, d);
                 if no_live_values(u, d, &s, &visible_crates).is_none() {
                     fresh_structs.push((d, s));
@@ -5780,7 +5886,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // (a tuple variant the edit adds: its constructor's signature)
                     if adt.is_enum {
                         if let Some(old) = u.tcx.adts.get(&d).cloned() {
-                            match enum_place(u, d, &old, &adt, before, &after, new_layout) {
+                            let unchecked = unchecked_reach.iter().find(|x| x.0 == d).map(|x| x.1.as_str());
+                            match enum_place(u, d, &old, &adt, before, &after, new_layout, unchecked) {
                                 Ok((placed, note)) => {
                                     adt = placed;
                                     if let Some(note) = note {
@@ -9136,7 +9243,7 @@ const STARTUP_SCAN_LOOK: std::time::Duration = std::time::Duration::from_millis(
 unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &mut Vec<Undo>) -> Vec<(u32, u32)> {
     use crate::harness::live;
     let what = paths.join(", ");
-    let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone(), patch: Some((o.changed, o.names.len())) };
+    let mut edit = live::Edit { paths, group: o.group, compile_ms: Some(o.ms[2]), restarted: false, changed: o.test_changes.clone(), patch: Some((o.changed, o.names.len())), reverted: Vec::new() };
     for line in &o.lines { eprintln!("relax live:   {line}"); }
     if o.rung != Rung::Patch {
         patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
@@ -9185,9 +9292,11 @@ unsafe fn test_edit(up: *mut Unit, paths: Vec<String>, o: &mut Outcome, undos: &
         crate::inspect::events::emit("patchreverted", &verdict_key(&what), &format!(
             "\"edit\":[{}],\"reverted\":true,\"groups\":{:?},\"fns\":[{}],\"error\":\"a fault in live test code\"",
             edit.paths.iter().map(|p| json_str(p)).collect::<Vec<_>>().join(","), groups, names.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(",")));
-        eprintln!("relax live: {what}: reverted patch groups {groups:?}; rerunning tests");
+        eprintln!("relax live: {what}: reverted patch groups {groups:?}; rerunning tests on the code from before them (their verdict is none on the saved source)");
         edit.compile_ms = None;
         edit.changed = None;
+        edit.patch = None;
+        edit.reverted.extend(groups);
     }
     back
 }
@@ -9399,7 +9508,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         if let Some(why) = host::take_harness_restart() {
             let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
             crate::harness::live::restart(crate::harness::live::Edit {
-                paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None, patch: None,
+                paths: std::mem::take(&mut host_edit), group, compile_ms: None, restarted: true, changed: None, patch: None, reverted: Vec::new(),
             }, &why);
         }
         // A patch's verdict settles ahead of the gates below: they hold the watch's own work (the
@@ -9757,7 +9866,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                 if crate::harness::live::enabled() {
                     let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
                     crate::harness::live::restart(crate::harness::live::Edit {
-                        paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None, patch: None,
+                        paths: changed.iter().map(|&k| files[k].0.clone()).collect(), group, compile_ms: None, restarted: true, changed: None, patch: None, reverted: Vec::new(),
                     }, &why);
                 } else { offer_restart(&why); }
                 for &k in &changed { files[k].2 = settled_stamps[k]; stalled.remove(&k); }
@@ -10007,7 +10116,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
                             let group = crate::owner::call(crate::owner::Class::Program, || (*up).begin_patch());
                             crate::harness::live::restart(crate::harness::live::Edit {
                                 paths: which.iter().map(|&k| files[k].0.clone()).collect(), group,
-                                compile_ms: Some(o.ms[2]), restarted: true, changed: None, patch: None,
+                                compile_ms: Some(o.ms[2]), restarted: true, changed: None, patch: None, reverted: Vec::new(),
                             }, &o.lines.join("; "));
                         }
                     } else { recover_hot_failure(failure, &o.lines, None); }
