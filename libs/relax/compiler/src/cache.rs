@@ -1230,6 +1230,10 @@ impl Cache {
         // which crates are bound to the loader's rustc build (provided.rs) is in the interface
         // fingerprints (items::apply_bound), so only the code that can reach a bound crate is keyed by it
         cfgh.u128(from.prog.session.options.fingerprint());
+        // the policy for third-party compile-time code (sandbox.rs Policy): `relax` and `makepad`
+        // of one tree share the codegen identity, and a registry proc macro expands from other
+        // inputs under each (crate_image::parse_options holds it for the front's stores)
+        cfgh.u8((crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed) as u8);
         // the static a #[global_allocator] program's allocator shim calls: code inlining a shim
         // caller (core::heap::alloc & co) is certified by crate fingerprints, which do not show
         // whether or which allocator the program has (the static's type is in the shim callers'
@@ -8925,6 +8929,52 @@ mod data_tests {
         assert!(!name, "r::name::<s::T> folds GAP_X: it misses and is built again");
         assert!(r_own, "r's own code hits: no late input of s reaches it");
         assert_eq!(run("two").0, [true; 3], "the entries recorded under the new value hit");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The policy for third-party compile-time code (sandbox.rs Policy: bare `relax` Open,
+    /// `makepad` Sandboxed) is in the keys of what an expansion reaches: the two binaries of one tree
+    /// share the codegen identity, and a registry proc macro expands from other inputs under each.
+    /// Code recorded under one policy is not linked under the other; the front's identity (parser
+    /// options: its store names, graph and collected identities) and the check verdicts' keys
+    /// differ; each policy's own code hits.
+    #[test]
+    fn code_and_front_stores_of_one_compile_time_policy_are_not_the_others() {
+        isolated_test!(code_and_front_stores_of_one_compile_time_policy_are_not_the_others);
+        use crate::sandbox::Policy;
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let dir = std::env::temp_dir().join(format!("relax-policy-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "#![no_std] pub fn one() -> u32 { 1 }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("a", dir.join("a.rs").to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let one = (0..u.prog.defs.len() as u32).map(DefId).find(|&d| u.prog.name(d) == "one").unwrap();
+        let id = u.fn_id(FnKey::Inst(one, vec![]));
+        // one run under `policy`: whether the slot hit (a miss is recorded), the parser options
+        // identity and crate a's front store name
+        let mut run = |policy: Policy| -> (bool, u128, String, u128) {
+            crate::sandbox::set_policy(policy);
+            let mut cache = open_test_cache(&u, &dir.join("cache"));
+            let hit = cache.lookup(&mut u, id).is_some();
+            if !hit { cache.record(&u, id, &[0xc3], &[], &[]); }
+            cache.flush().unwrap();
+            (hit, crate::crate_image::parse_options(&session.options), front_store_name(&session.options, "a", cache.fps[0]), crate::check_reuse::env_key(&u.prog))
+        };
+        let open = run(Policy::Open);
+        assert!(!open.0, "a cold cache");
+        let sandboxed = run(Policy::Sandboxed);
+        assert!(!sandboxed.0, "code recorded under Open is not linked under Sandboxed");
+        assert_ne!(open.1, sandboxed.1, "the parser options identity (front graph and collected identities) holds the policy");
+        assert_ne!(open.2, sandboxed.2, "a crate's front store is each policy's own");
+        assert_ne!(open.3, sandboxed.3, "so are the check verdicts' keys");
+        assert!(run(Policy::Open).0, "Open's own code hits");
+        assert!(run(Policy::Sandboxed).0, "Sandboxed's own code hits");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
