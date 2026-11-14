@@ -556,7 +556,7 @@ impl Resolver {
 
     fn registry_dir(&self, name: &str, req: &str) -> Result<String, String> {
         match &self.vendor {
-            Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name),
+            Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name, req),
             // the repository's package of that name (cargo's discovery, as for a git dependency)
             Some((Vendor::Git(src), config)) => return self.git_dir(src, name).map_err(|e| format!("{} (crates-io's replacement, {})", e, config)),
             None => {}
@@ -610,8 +610,8 @@ impl Resolver {
 
     /// Registry package `name` in the vendored directory `vdir`: `<name>` (one version) or
     /// `<name>-<version>` (cargo vendor's names when it holds several); with Cargo.lock, the locked
-    /// version, without, the only one there.
-    fn vendored_dir(&self, vdir: &str, config: &str, name: &str) -> Result<String, String> {
+    /// version satisfying the dependency requirement, without, the only matching one there.
+    fn vendored_dir(&self, vdir: &str, config: &str, name: &str, req: &str) -> Result<String, String> {
         let mut found: Vec<(String, String)> = Vec::new();
         for (entry, is_dir) in crate::vfs::read_dir(vdir).map_err(|e| format!("{} (crates-io's replacement, {}): {}", vdir, config, e))? {
             if !is_dir || !(entry == name || entry.strip_prefix(name).is_some_and(|r| r.starts_with('-') && r[1..].starts_with(|c: char| c.is_ascii_digit()))) {
@@ -620,7 +620,8 @@ impl Resolver {
             let d = format!("{}/{}", vdir, entry);
             if let Ok(t) = read_toml(&format!("{}/Cargo.toml", d)) {
                 if let Some(v) = table(&t, "package").and_then(|p| s(p, "version")) {
-                    if table(&t, "package").and_then(|p| s(p, "name")).as_deref() == Some(name) {
+                    if table(&t, "package").and_then(|p| s(p, "name")).as_deref() == Some(name)
+                        && crate::registry::Version::parse(&v).is_some_and(|ver| crate::registry::matches(req, &ver)) {
                         found.push((v, d));
                     }
                 }
@@ -3142,6 +3143,42 @@ required-features = ["b", "manual"]
         bin.required_features.clear();
         assert!(bin.enabled(&BTreeSet::new(), false).unwrap());
         assert!(bin.enabled(&BTreeSet::new(), true).unwrap());
+    }
+
+    #[test]
+    fn vendored_locked_major_versions_follow_each_dependency_requirement() {
+        let root = tree("vendor-locked-majors", &[
+            ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nold = { package = \"dep\", version = \"1\" }\nnew = { package = \"dep\", version = \"2\" }\n"),
+            ("src/lib.rs", ""),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\ndirectory = \"vendor\"\n"),
+            ("Cargo.lock", "version = 4\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\n"),
+            ("vendor/dep-1.0.0/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"1.0.0\"\n"),
+            ("vendor/dep-1.0.0/src/lib.rs", ""),
+            ("vendor/dep-2.0.0/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"2.0.0\"\n"),
+            ("vendor/dep-2.0.0/src/lib.rs", ""),
+        ]);
+        let sess = std::sync::Arc::new(crate::Session::default());
+        let graph = unit_graph(&sess, &root, "app", &[]).unwrap();
+        let mut sources: Vec<_> = graph.units.iter().filter(|u| u.name == "dep").map(|u| u.src_path.clone()).collect();
+        sources.sort();
+        assert_eq!(sources, [format!("{root}/vendor/dep-1.0.0/src/lib.rs"), format!("{root}/vendor/dep-2.0.0/src/lib.rs")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vendored_version_must_satisfy_the_requirement_even_when_locked() {
+        let root = tree("vendor-unsatisfied", &[
+            ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ndep = \"2\"\n"),
+            ("src/lib.rs", ""),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"local\"\n[source.local]\ndirectory = \"vendor\"\n"),
+            ("Cargo.lock", "version = 4\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\n"),
+            ("vendor/dep/Cargo.toml", "[package]\nname = \"dep\"\nversion = \"1.0.0\"\n"),
+            ("vendor/dep/src/lib.rs", ""),
+        ]);
+        let sess = std::sync::Arc::new(crate::Session::default());
+        let error = unit_graph(&sess, &root, "app", &[]).err().expect("a locked version cannot override an incompatible requirement");
+        assert!(error.contains("not vendored"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn tree(name: &str, files: &[(&str, &str)]) -> String {
