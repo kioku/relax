@@ -614,7 +614,9 @@ pub struct Program {
     /// the crates being checked (`makepad check`): the only ones whose paths are privacy-checked
     pub own_crates: Vec<bool>,
     /// rustc's glob ambiguities in the checked crates (the import replay, program/rsim.rs):
-    /// (module, name, type namespace) -> 1 an error, 2 the lint `ambiguous_glob_imports`
+    /// (module, name, type namespace) -> 1 an error, 2 the lint `ambiguous_glob_imports`, for what a
+    /// use finds (bits 0-1) and for the module's glob declaration (bits 2-3); bit 4: the module
+    /// binds the name itself (rsim.rs `ambiguity_table`)
     pub sim_ambiguity: Option<HashMap<(u32, Sym, bool), u8>>,
     /// what the replay reported, until the check emits it
     pub sim_diags: Option<Vec<SimDiag>>,
@@ -5405,6 +5407,8 @@ impl Program {
         // the most visible binding (rustc_resolve imports.rs / try_define): a module's private
         // `use` never leaks through `pub use module::*`
         let mut best: Option<(DefId, BindVis)> = None;
+        let collecting = q.collect == Some(m);
+        if collecting { q.collected.clear(); }
         for &(g, gv) in &md.globs {
             let gd = self.def(g);
             let r = match gd.kind {
@@ -5415,6 +5419,7 @@ impl Program {
                 DefKind::Enum => self.lookup_in_container(g, name, false).map(|d| (d, None)),
                 _ => None,
             };
+            if collecting { q.collected.push((g, r)); }
             if let Some((d, v)) = r {
                 if !self.vis_visible(v, m) {
                     continue;
@@ -5429,12 +5434,25 @@ impl Program {
                         }
                     }
                 }
-                if matches!(best, Some((_, None))) {
+                if matches!(best, Some((_, None))) && !collecting {
                     break;
                 }
             }
         }
         best
+    }
+
+    /// What each glob of module `m` gives it for `name` within `m`'s own lookup (a glob cycle back
+    /// to `m` answers what `m` binds as the lookup's passes settle it, not what a lookup entering
+    /// the cycle at the glob's module finds), with precise visibilities; None: `m` binds the name
+    /// itself. No import uses are recorded.
+    pub(crate) fn glob_answers(&self, m: u32, name: Sym, ns_type: bool) -> Option<Vec<(DefId, Option<(DefId, BindVis)>)>> {
+        let md = &self.mods[m as usize];
+        if if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) } { return None; }
+        let _quiet = QuietLookups::begin();
+        let mut q = GlobQuery { precise: true, collect: Some(m), ..Default::default() };
+        self.lookup_in_module_vis(m, name, ns_type, &mut q);
+        Some(q.collected)
     }
 
     /// Lexical lookup from a (possibly anonymous) module: block modules fall through to
@@ -6873,6 +6891,10 @@ struct GlobQuery {
     /// and how often such an answer was read
     tainted: std::collections::HashSet<u32>,
     taints: usize,
+    /// a module whose globs' answers are kept, each glob's (`collected`, of the last pass): what
+    /// they give the module within its own lookup (privacy.rs `glob_ambiguity_in`)
+    collect: Option<u32>,
+    collected: Vec<(DefId, Option<(DefId, BindVis)>)>,
 }
 
 /// A trait a module's scope binds: the trait, the binding's visibility and the binding's name

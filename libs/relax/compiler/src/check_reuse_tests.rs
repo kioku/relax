@@ -776,5 +776,12 @@ fn an_app_check_reads_the_globs_of_unchecked_crates_as_rustc_does() {
     write("ws/app/lib.rs", &app("mod own { pub struct Thing; }\nuse own::*;\npub fn clash() -> u32 { let _ = Thing; 0 }\n"));
     let clash = check();
     assert!(clash.0.is_some_and(|c| c != 0) && clash.1.contains("E0659") && clash.1.contains("`Thing` is ambiguous"), "{}", clash.1);
+    // the dep's own ambiguous `Dup` (its two globs): rustc reads it from metadata as an ambiguous
+    // child, and each use -- through the glob, as a type, by path, by a single import and through
+    // that import -- is the deny-by-default lint `ambiguous_glob_imports`, not E0659
+    write("ws/app/lib.rs", &app("pub fn dup(_d: Dup) { let _ = Dup; let _ = dep::Dup; }\nmod one { use dep::Dup; pub fn g() { let _ = Dup; } }\n"));
+    let dup = check();
+    let lines: Vec<&str> = dup.1.lines().filter(|l| l.contains("`Dup` is ambiguous")).collect();
+    assert!(dup.0.is_some_and(|c| c != 0) && lines.len() == 5 && lines.iter().all(|l| l.contains("ambiguous_glob_imports") && !l.contains("E0659")), "{}", dup.1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
