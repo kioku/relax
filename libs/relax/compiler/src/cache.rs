@@ -1733,8 +1733,12 @@ impl Cache {
         self.pending_bytes = 0;
         let marks = front_run::run_marks();
         let late = crate::sip::late_inputs();
+        let moved = crate::sip::late_moved();
         let mut files = Vec::new();
         for ((c, front), mut entries) in by_store(pending) {
+            if self.reads_moved(c, front, &moved) {
+                continue;
+            }
             if !front {
                 entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: self.code_ledger(c, &late) }.into());
             }
@@ -4504,9 +4508,13 @@ impl Cache {
         // the images the references among `pending` name, written by now
         let marks = front_run::run_marks();
         let late = crate::sip::late_inputs();
+        let moved = crate::sip::late_moved();
         pack::ensure_private_dir(&self.dir)?;
         let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
         for ((c, front), mut entries) in by_store(pending) {
+            if self.reads_moved(c, front, &moved) {
+                continue;
+            }
             // the ledger: the include!/env! inputs as this run saw them -- the crate's own for its
             // front store, its dependency closure's for its code store
             let ledger = if front { None } else { Some(self.code_ledger(c, &late)) };
@@ -4915,6 +4923,30 @@ fn sealed_crates(prog: &crate::program::Program, ncr: usize, anchors: &crate::di
 }
 
 impl Cache {
+    /// Whether crate `c`'s store (`front`: its front store, else its code store) has in its ledger
+    /// a late input whose hash moved in this run (`moved`: sip::late_moved, a live edit of an
+    /// included file). Its entries are not written: those built before the edit read the old
+    /// contents and the ledger would name the new, so a run of the restored file found the store
+    /// stale, the good entries an earlier run wrote with it, and started cold (cache_warm_const_edit's
+    /// include probes, now and then: when a session lived long enough to spill, 11-14).
+    fn reads_moved(&self, c: u32, front: bool, moved: &[(String, u8, String)]) -> bool {
+        if moved.is_empty() {
+            return false;
+        }
+        let at = |name: &str| self.crate_names.iter().position(|n| n == name);
+        let hit = match front {
+            true => moved.iter().any(|m| at(&m.0) == Some(c as usize)),
+            false => {
+                let Some(set) = self.crate_closure.get(c as usize) else { return false };
+                moved.iter().any(|m| at(&m.0).is_some_and(|i| set.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1)))
+            }
+        };
+        if hit && self.verbose {
+            eprintln!("relax cache: the {} store of crate {} is not written: an included file it reads changed in this run", if front { "front" } else { "code" }, self.crate_names.get(c as usize).map_or("?", |n| n.as_str()));
+        }
+        hit
+    }
+
     /// Crate `c`'s code store ledger: the late inputs of every crate in its dependency closure.
     fn code_ledger(&self, c: u32, late: &[(String, u8, String, u128)]) -> Vec<u8> {
         let Some(set) = self.crate_closure.get(c as usize) else { return encode_ledger(std::iter::empty()) };
