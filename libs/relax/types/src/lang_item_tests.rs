@@ -181,8 +181,12 @@ fn relax_std_marks_container_drops_may_dangle() {
     prog.resolve_imports();
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
-    // `Vec<&T>` may be dropped while `T` is borrowed: the element type is not among what the destructor touches.
+    // `Vec<&T>` may be dropped while `T` is borrowed: the element type is not among what the
+    // destructor touches. Its allocator is (`unsafe impl<#[may_dangle] T, A: Allocator> Drop`, as
+    // rustc's alloc has it): what must outlive the drop is `A` alone, rustc's destructor_constraints.
     let vec = named(&prog, "Vec");
     let constraint = adt_dtorck_constraint(&tcx, &prog, vec, 256);
-    assert!(constraint.outlives.is_empty(), "{constraint:?}");
+    let params = tcx.generic_indices_of(&prog, vec).identity_args(&tcx.tys);
+    assert_eq!(params.len(), 2, "Vec<T, A>");
+    assert_eq!(constraint.outlives, [params[1]], "{constraint:?}");
 }

@@ -909,7 +909,10 @@ fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Op
     let TyKind::Adt(vd, va, _) = tcx.tys.kind(vt) else { return None };
     let (vd, va) = (*vd, *va);
     let vadt = tcx.adts.get(&vd)?;
-    if tcx.tys.list(va).len() != 1 || vadt.variants.len() != 1 {
+    // Vec<u8, Global>: the element and the global allocator (zero-sized; rustc's RawVec holds it
+    // after the words, Relax's Vec after its three words too)
+    let vargs = tcx.tys.list(va);
+    if vargs.len() != 2 || !is_global_alloc(tcx, vargs[1]) || vadt.variants.len() != 1 {
         return None;
     }
     let pb = std::mem::size_of::<usize>() as u32;
@@ -1025,9 +1028,13 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
         if let Some(std) = std_same {
             let args = tcx.tys.list(*a);
             let same = |x: TyId| same_bytes(prog, tcx, krate, x, ok, std_same, opaque, depth + 1);
-            // String, Vec<T> of such T
+            // String, Vec<T> of such T in the global allocator (another allocator is laid out
+            // by each side's own rules: rustc keeps it in its RawVec)
             let vec_like = |x: TyId| match tcx.tys.kind(x) {
-                TyKind::Adt(xd, xa, _) => tcx.lang_items.get(LangItem::String) == Some(*xd) || (*xd == std.vec && tcx.tys.list(*xa).first().is_some_and(|e| same(*e))),
+                TyKind::Adt(xd, xa, _) => tcx.lang_items.get(LangItem::String) == Some(*xd) || (*xd == std.vec && match tcx.tys.list(*xa) {
+                    [e, al] => same(*e) && is_global_alloc(tcx, *al),
+                    _ => false,
+                }),
                 _ => false,
             };
             if vec_like(t) {

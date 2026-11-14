@@ -3858,7 +3858,8 @@ impl<'a> Lcx<'a> {
     /// owned here (a local, a by-value capture this body owns, a temporary) and may be moved.
     fn illegal_move(&mut self, e: ExprId) -> Option<String> {
         let ast = self.ast();
-        let ts = |l: &Self, t: TyId| crate::typeck::ty_to_string(false, &l.u.prog, &l.u.tcx, t);
+        // as rustc's diagnostics print a type (`Vec<String>` for `Vec<String, Global>`)
+        let ts = |l: &Self, t: TyId| crate::typeck::ty_to_diag_string(&l.u.prog, &l.u.tcx, t);
         match &ast.expr(e).kind {
             ExprKind::Paren(x) => self.illegal_move(*x),
             ExprKind::Path(_) => match self.b.res.get(&e.0).copied() {
