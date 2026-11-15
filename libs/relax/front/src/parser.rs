@@ -5667,7 +5667,9 @@ impl<'a> Parser<'a> {
         let lo = self.lo();
         // rustc_parse parser/expr.rs: parse_expr_bottom returns a Path expression
         // for MetaVarKind::Path; calls follow, but `{ .. }` and `::` do not extend it.
-        if self.path_frags.contains(&{ self.tok().lo }) {
+        // A parsed expression splice can retain the authored span of a path fragment.
+        // Its AST is already available: do not reparse its Interp token as path syntax.
+        if self.kind() != T::Interp && self.path_frags.contains(&{ self.tok().lo }) {
             let path = self.path(true)?;
             return Ok(self.mk_expr(ExprKind::Path(path), lo));
         }

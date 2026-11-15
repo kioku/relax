@@ -3465,8 +3465,9 @@ impl<'a> Parser<'a> {
         if t.kind != m.kind {
             return false;
         }
-        // a forwarded statement is one opaque nonterminal, not its first written token
-        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ t.lo }) {
+        // Forwarded nonterminals are opaque, not their first written token.
+        // Ident, lifetime and tt captures have no forwarded kind and remain matchable.
+        if self.forwarded_kind(t.lo).is_some() {
             return false;
         }
         match t.kind {
