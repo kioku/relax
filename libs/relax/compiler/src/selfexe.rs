@@ -717,6 +717,7 @@ pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
             unsafe { std::env::set_var("RELAX_LOADER", loader) };
         }
     }
+    relax_base::progenv::mark_native_self_exec();
     let mut out = run.line.clone();
     out[0] = args.first()?.clone();
     out.extend(rest.iter().cloned());
