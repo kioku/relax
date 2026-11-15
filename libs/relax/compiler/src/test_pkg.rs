@@ -417,7 +417,11 @@ fn select_tests(package: &str, asked: TestSelection<'_>, targets: &crate::resolv
         (asked.examples, example_targets, "--example", asked.all_examples),
     ] {
         if !all_tests && !entire && names.is_none() { continue; }
-        let names = names.unwrap_or_default();
+        // Cargo's --bins subsumes named bins; --tests subsumes named integration
+        // tests, not missing bins or examples. Keep other named-target checks and
+        // the errors below for selectors that select no real target.
+        let all_of_kind = (asked.all_bins && flag == "--bin") || (asked.all_tests && flag == "--test");
+        let names = if all_of_kind { &[][..] } else { names.unwrap_or_default() };
         for n in names {
             if !all.iter().any(|t| &t.0 == n) { return Err(error(true, &format!("no target named `{n}`"))); }
         }
@@ -731,10 +735,10 @@ mod tests {
         assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["x".to_string()]), ..Default::default() }, &targets), Ok(expected.clone()),
             "a named integration test beside --tests never narrows its set");
         let missing = "relax test: no target named `nope` in package `sample`; its test targets: --lib, --bin app, --test x, --test y".to_string();
-        assert_eq!(select(TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing.clone()),
+        assert_eq!(select(TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing),
             "an unknown named target lists all available selectors");
-        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Err(missing),
-            "--tests still validates a named selector beside it");
+        assert_eq!(select(TestSelection { all_tests: true, tests: Some(&["nope".to_string()]), ..Default::default() }, &targets), Ok(expected.clone()),
+            "as cargo does, --tests subsumes even an unknown named integration test");
 
         let example = ("demo".to_string(), "examples/demo.rs".to_string(), true);
         targets.examples = vec![example.clone()];
@@ -758,6 +762,9 @@ mod tests {
         assert_eq!(select(TestSelection { all_bins: true, bins: Some(&["app".to_string()]), ..Default::default() }, &targets),
             Ok(vec![Some(("src/main.rs".to_string(), false)), Some(("src/bin/tool.rs".to_string(), false))]),
             "--bins takes every bin, a test = false one too, and a name beside it does not narrow it");
+        assert_eq!(select(TestSelection { all_bins: true, bins: Some(&["nope".to_string()]), ..Default::default() }, &targets),
+            Ok(vec![Some(("src/main.rs".to_string(), false)), Some(("src/bin/tool.rs".to_string(), false))]),
+            "as cargo does, --bins subsumes even an unknown named bin");
         assert!(select_tests("sample", TestSelection { tests: Some(&["nope".to_string()]), ..Default::default() }, &targets).is_err_and(|e| e.0),
             "a missing named target is told apart from a selector that matched nothing");
 
