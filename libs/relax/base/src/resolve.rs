@@ -314,6 +314,18 @@ fn table<'a>(t: &'a TomlTable, k: &str) -> Option<&'a TomlTable> {
     t.get(k).and_then(|v| v.as_table())
 }
 
+/// Cargo target declarations have the same meaning as `[[bin]]` sections or
+/// `bin = [{ ... }]` values. The TOML parser preserves those two spellings.
+fn target_tables<'a>(t: &'a TomlTable, kind: &str) -> Result<Vec<&'a TomlTable>, String> {
+    match t.get(kind) {
+        None => Ok(Vec::new()),
+        Some(Toml::ArrayOfTables(tables)) => Ok(tables.iter().collect()),
+        Some(Toml::Array(values)) => values.iter().map(|value| value.as_table()
+            .ok_or_else(|| format!("manifest target `{kind}` must be an array of tables"))).collect(),
+        _ => Err(format!("manifest target `{kind}` must be an array of tables")),
+    }
+}
+
 /// A `[patch]` replacement: a path package or a git source.
 #[derive(Clone, Debug)]
 enum Patch {
@@ -829,7 +841,7 @@ impl Resolver {
         });
         // [[bin]] + discovered bins
         let mut bins: Vec<Target> = Vec::new();
-        let explicit = t.get("bin").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let explicit = target_tables(&t, "bin")?;
         for bt in &explicit {
             let Some(bname) = s(bt, "name") else { continue };
             let path = match s(bt, "path") {
@@ -880,7 +892,7 @@ impl Resolver {
         // unless `autotests = false`; an explicit target replaces the discovered one of its name
         // or path; edition 2015 packages with explicit [[test]] targets discover none)
         let mut tests: Vec<Target> = Vec::new();
-        let explicit_tests = t.get("test").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let explicit_tests = target_tables(&t, "test")?;
         for tt in &explicit_tests {
             let Some(tname) = s(tt, "name") else { continue };
             let path = match s(tt, "path") {
@@ -924,7 +936,7 @@ impl Resolver {
         // examples/*/main.rs unless `autoexamples = false`, as for tests). A `crate-type` other
         // than `bin` is a library example: no program to run.
         let mut examples: Vec<Target> = Vec::new();
-        let explicit_examples = t.get("example").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        let explicit_examples = target_tables(&t, "example")?;
         for et in &explicit_examples {
             let Some(ename) = s(et, "name") else { continue };
             let path = match s(et, "path") {
@@ -2863,9 +2875,9 @@ fn metadata_targets(m: &Manifest) -> Result<Vec<String>, String> {
     let t = read_toml(&format!("{}/Cargo.toml", m.dir))?;
     let pkg = table(&t, "package").unwrap();
     for (kind, folder, auto) in [("example", "examples", "autoexamples"), ("bench", "benches", "autobenches")] {
-        let explicit = t.get(kind).and_then(|x| x.as_array_of_tables()).unwrap_or_default();
+        let explicit = target_tables(&t, kind)?;
         let mut found = Vec::new();
-        for e in explicit {
+        for e in &explicit {
             let Some(name) = s(e, "name") else { continue };
             let path = match s(e, "path") {
                 Some(path) => join(&m.dir, &path),
@@ -3281,6 +3293,54 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
 #[cfg(test)]
 mod root_tests {
     use super::*;
+
+    #[test]
+    fn inline_target_arrays_preserve_explicit_targets_and_metadata() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("inline-targets", &[
+            ("Cargo.toml", r#"
+package = { name = "app", version = "0.1.0", edition = "2021", autobins = false, autotests = false, autoexamples = false, autobenches = false }
+workspace = {}
+features = { selected = [] }
+bin = [{ name = "command", path = "other/tool.rs", required-features = ["selected"], test = false, harness = false }]
+test = [{ name = "integration", path = "other/check.rs", harness = false }]
+example = [{ name = "sample", path = "other/sample.rs", crate-type = ["rlib"] }]
+bench = [{ name = "measure", path = "other/measure.rs", harness = false }]
+"#),
+            ("src/lib.rs", ""),
+            ("other/tool.rs", "fn main() {}"),
+            ("other/check.rs", "fn main() {}"),
+            ("other/sample.rs", "pub fn sample() {}"),
+            ("other/measure.rs", "fn main() {}"),
+        ]);
+        let mut resolver = Resolver::new(sess, &root).unwrap();
+        let index = resolver.find_member("app").unwrap();
+        let manifest = &resolver.manifests[index];
+        assert_eq!(manifest.bins.len(), 1);
+        assert_eq!(manifest.bins[0].name, "command");
+        assert_eq!(manifest.bins[0].required_features, ["selected"]);
+        assert!(!manifest.bins[0].test && !manifest.bins[0].harness);
+        assert_eq!(manifest.tests.len(), 1);
+        assert_eq!(manifest.tests[0].name, "integration");
+        assert!(!manifest.tests[0].harness);
+        assert_eq!(manifest.examples.len(), 1);
+        assert_eq!(manifest.examples[0].name, "sample");
+        assert_eq!(manifest.examples[0].kind, ["rlib"]);
+        let metadata = metadata_targets(manifest).unwrap();
+        assert_eq!(metadata.len(), 5);
+        assert!(metadata.iter().any(|entry| entry.contains("\"name\":\"measure\"")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn target_arrays_reject_non_table_members() {
+        for text in ["bin = 1", "bin = {}", "bin = [{name = 'ok'}, 1]"] {
+            let parsed = parse_toml(text).unwrap();
+            assert!(target_tables(&parsed.root, "bin").is_err(), "{text}");
+        }
+        assert!(target_tables(&parse_toml("bin = []").unwrap().root, "bin").unwrap().is_empty());
+        assert!(target_tables(&parse_toml("[[bin]]\nname = 'ok'").unwrap().root, "bin").is_ok());
+    }
 
     /// A strong `x/f` on an optional dependency enables the package's feature `x` when it has one,
     /// an explicit `x = ["dep:x"]` included (num-rational's `num-bigint-std = ["num-bigint/std"]`
