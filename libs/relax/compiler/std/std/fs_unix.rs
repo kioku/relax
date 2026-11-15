@@ -1119,7 +1119,12 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     opts.set_mode(meta.permissions().mode_bits());
     let mut writer = opts.open(to.as_ref())?;
     writer.set_permissions(meta.permissions())?;
-    io::copy(&mut reader, &mut writer)
+    let copied = io::copy(&mut reader, &mut writer)?;
+    // A copied JIT executable must still name its live program when a native
+    // child starts it. No program environment is written into the copied file.
+    extern "C" { fn __relax_executable_copied(from: i32, to: i32); }
+    unsafe { __relax_executable_copied(reader.as_raw_fd(), writer.as_raw_fd()) };
+    Ok(copied)
 }
 
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
