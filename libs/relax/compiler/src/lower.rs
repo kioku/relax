@@ -8201,7 +8201,17 @@ impl<'a> Lcx<'a> {
         };
         let root = self.field_move_path(bx);
         let mark = self.stmt_temps.len();
-        let (bp, bt) = self.lower_place(bx);
+        let mut temp_root = None;
+        let (bp, bt) = if let Some((expr, path)) = self.rvalue_proj(bx) {
+            // The projected place belongs to the entire temporary, not a separate
+            // value to drop. Track moved fields from that owner's root, as field reads do.
+            let (addr, ty, flag, place, field_ty) = self.lower_rvalue_proj(expr, &path);
+            self.stmt_temps.push((addr, ty, Some(flag)));
+            temp_root = Some((flag, path));
+            (place, field_ty)
+        } else {
+            self.lower_place(bx)
+        };
         for fi in 0..nf as u32 {
             if given.iter().any(|g| g.0 == fi) {
                 continue;
@@ -8215,10 +8225,14 @@ impl<'a> Lcx<'a> {
                     let mut p = path.clone();
                     p.push((vi, fi));
                     self.moved_field(*li, &p);
+                } else if let Some((flag, path)) = &temp_root {
+                    let mut p = path.clone();
+                    p.push((vi, fi));
+                    self.moved_temp_part(*flag, &p);
                 }
             }
         }
-        if root.is_none() && !self.base_is_borrowed_place(bx) {
+        if root.is_none() && temp_root.is_none() && !self.base_is_borrowed_place(bx) {
             // a temporary base: its fields that were not taken are dropped with it
             // (the base temporary itself is not dropped as a whole: its taken fields moved)
             let ba = self.place_addr(&bp, bt);
