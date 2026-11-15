@@ -50,6 +50,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod copies;
+pub(crate) use copies::note as executable_copied;
+
 /// The folder of this run's links: its executable's (`run/`), or a test's above its `deps/`
 /// (`t-<key>`), where the package's binaries go (`add_bins`)
 static OWN_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -655,7 +658,7 @@ pub fn add_bins(launchers: &[String]) -> Vec<PathBuf> {
 /// binary runs that binary), so the loader running from one spawns itself by RELAX_LOADER
 /// (dirs::loader_exe).
 pub fn is_link(exe: &Path) -> bool {
-    crate::dirs::is_run_link(exe)
+    crate::dirs::is_run_link(exe) || copies::origin(exe).is_some()
 }
 
 /// A start of a package binary above a test's `deps/` (Windows, `add_bins`): `args` with the
@@ -689,7 +692,8 @@ pub fn bin_start(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
 /// it, with the program's arguments alone.)
 pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
+    let copied_from = copies::origin(&exe);
+    let dir = copied_from.as_deref().unwrap_or(exe.parent()?);
     if dir.file_name().is_some_and(|n| n == LAUNCH) {
         return None;
     }
@@ -706,6 +710,13 @@ pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
         }
     };
     let _ = RELAUNCH.set((run.pid, run.handed));
+    if copied_from.is_some() {
+        // The copied file is an application executable, not a new loader. Keep
+        // later compiler/native spawns on the loader recorded by its live run.
+        if let Some(loader) = crate::dirs::recorded_loader(&dir.join(exe.file_name()?)) {
+            unsafe { std::env::set_var("RELAX_LOADER", loader) };
+        }
+    }
     let mut out = run.line.clone();
     out[0] = args.first()?.clone();
     out.extend(rest.iter().cloned());
