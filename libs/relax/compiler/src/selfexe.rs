@@ -706,6 +706,7 @@ pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
         }
     };
     let _ = RELAUNCH.set((run.pid, run.handed));
+    relax_base::progenv::mark_native_self_exec();
     let mut out = run.line.clone();
     out[0] = args.first()?.clone();
     out.extend(rest.iter().cloned());

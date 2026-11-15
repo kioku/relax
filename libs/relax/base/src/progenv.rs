@@ -75,12 +75,15 @@ pub const ALLOW_C: &[u8] = b"RELAX_ALLOW_C";
 /// The native build the program was built with when the run took it from the run that prepared
 /// it (a test's package binary: its test's): a run of this program again takes it too.
 pub const RUN_NATIVE: &[u8] = b"RELAX_RUN_NATIVE";
+/// A native-style execution of the current program, not a user test command. Its harness
+/// keeps native libtest exit semantics; the direct CLI keeps its no-matched-filter guard.
+pub const SELF_EXEC_CHILD: &[u8] = b"RELAX_SELF_EXEC_CHILD";
 /// Run facts: what the host says of this run, for this run again (a self-exec child) and nothing
 /// else; the mount also for a child in this process's folder or in the mount. The self-exec
 /// command line (Relax std's spawn of this program; its first word is the program's own
 /// executable, relax-compiler selfexe.rs), whether the run added its `--silent`, a bare relax's
 /// `RELAX_ALLOW_C` and the native build it took.
-pub const RUN_FACTS: [&[u8]; 8] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE, ALLOW_C, RUN_NATIVE];
+pub const RUN_FACTS: [&[u8]; 9] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE, ALLOW_C, RUN_NATIVE, SELF_EXEC_CHILD];
 /// The build environment a run hands the runs of the programs it prepared (`BUILD`, `encode`d):
 /// their hosts build as it does. Never the program's: the child host takes it out at its start.
 pub const BUILD_ENV: &[u8] = b"RELAX_BUILD_ENV";
@@ -108,6 +111,28 @@ pub fn run_fact(name: &[u8]) -> bool {
 pub fn set_run_fact(name: &str, value: impl AsRef<std::ffi::OsStr>) {
     assert!(run_fact(name.as_bytes()), "{name} is no run fact (progenv RUN_FACTS)");
     std::env::set_var(name, value);
+}
+
+/// A shell/C exec is native-style reexecution too. Preserve its pre-marker program
+/// view in the ordinary handover; changing only the real environment leaks a new
+/// variable to an env-cleared program (or replaces a caller's explicit value).
+pub fn mark_native_self_exec() {
+    let real: Env = std::env::vars_os().map(|(k, v)| (k.as_encoded_bytes().to_vec(), v.as_encoded_bytes().to_vec())).collect();
+    for (name, value) in self_exec_handover(&real).expect("native self-exec program environment") {
+        let value = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(value) };
+        std::env::set_var(std::str::from_utf8(&name).unwrap(), value);
+    }
+}
+
+fn self_exec_handover(real: &Env) -> Result<Env, String> {
+    let mut own = match real.iter().find(|(k, _)| same_name(k, PROGRAM_ENV)) {
+        Some((_, value)) => parse(value)?,
+        None => Vec::new(),
+    };
+    if !own.iter().any(|(k, _)| same_name(k, SELF_EXEC_CHILD)) {
+        own.push((SELF_EXEC_CHILD.to_vec(), real.iter().find(|(k, _)| same_name(k, SELF_EXEC_CHILD)).map(|(_, v)| v.clone())));
+    }
+    Ok(vec![(PROGRAM_ENV.to_vec(), encode(&own)), (SELF_EXEC_CHILD.to_vec(), b"1".to_vec())])
 }
 
 /// A host's own spawn of a child that is not this run (a build script, cargo, a check of a
@@ -236,7 +261,10 @@ pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)]
     let wrote = |k: &[u8]| own.iter().any(|(o, _)| same_name(o, k)) || spawn.edits.iter().any(|(e, _)| same_name(e, k));
     let host_value = |k: &[u8]| real.iter().find(|(r, _)| same_name(r, k)).map(|(_, v)| v.clone());
     let mut env = if spawn.self_exec {
-        let host: Env = real.iter().filter(|(k, _)| reserved(k) && !same_name(k, PROGRAM_ENV)).cloned().collect();
+        let mut host: Env = real.iter().filter(|(k, _)| reserved(k) && !same_name(k, PROGRAM_ENV)).cloned().collect();
+        // State this before calculating the overlay: env_clear must still hide
+        // the new host fact from the program while std can read the host value.
+        set(&mut host, SELF_EXEC_CHILD, Some(b"1"));
         let mut differ: Own = Vec::new();
         for (k, v) in &view {
             if reserved(k) && !host.iter().any(|(h, hv)| same_name(h, k) && hv == v) {
@@ -1018,6 +1046,7 @@ mod tests {
             (b("RELAX_BOOT_TRACE"), Some(b("1"))),
             (b("RELAX_CACHE_DIR"), Some(b("/scratch/cache"))),
             (b("RELAX_LINT_FLAGS"), None),
+            (SELF_EXEC_CHILD.to_vec(), None),
             (b("RELAX_STD"), Some(b("/std"))),
         ], "the program's set and removed reserved names travel in PROGRAM_ENV, and only those");
         assert_eq!(get(&child, "HOME"), Some(&b"/h"[..]), "a name outside the namespace comes from the program's view (set)");
@@ -1025,7 +1054,7 @@ mod tests {
 
         let cleared = child_env(&real, &own, &Spawn { edits: &[], clear: true, self_exec: true, dir: ChildDir::Same, host: &[] });
         assert_eq!(get(&cleared, "RELAX_CACHE_DIR"), Some(&b"/host/cache"[..]), "after env_clear the self-exec child's host still has its own settings");
-        assert!(program_env(&cleared).iter().all(|(_, v)| v.is_none()) && program_env(&cleared).len() == real.iter().filter(|(k, _)| reserved(k)).count(),
+        assert!(program_env(&cleared).iter().all(|(_, v)| v.is_none()) && program_env(&cleared).len() == real.iter().filter(|(k, _)| reserved(k)).count() + 1,
             "after env_clear the self-exec child program sees no reserved name: {:?}", program_env(&cleared));
         assert_eq!(get(&cleared, "PATH"), None, "env_clear clears the names outside the namespace for both");
 
@@ -1035,7 +1064,7 @@ mod tests {
         assert_eq!((get(&ran, "APP_MODE"), get(&ran, "PATH")), (None, Some(&b"/bin"[..])), "a self-exec child's host does not get the run-env: it keeps this process's values");
         let mut ran_travel = program_env(&ran);
         ran_travel.sort();
-        assert_eq!(ran_travel, vec![(b("APP_MODE"), Some(b("demo"))), (b("PATH"), Some(b("/app/bin")))], "the run-env travels to the self-exec child program in PROGRAM_ENV");
+        assert_eq!(ran_travel, vec![(b("APP_MODE"), Some(b("demo"))), (b("PATH"), Some(b("/app/bin"))), (SELF_EXEC_CHILD.to_vec(), None)], "the run-env travels to the self-exec child program in PROGRAM_ENV");
         let ran_foreign = child_env(&real, &run_env, &Spawn { edits: &[], clear: false, self_exec: false, dir: ChildDir::Same, host: &[] });
         assert_eq!((get(&ran_foreign, "APP_MODE"), get(&ran_foreign, "PATH")), (Some(&b"demo"[..]), Some(&b"/app/bin"[..])), "a foreign child gets the program's view, run-env included");
         // a bare relax's RELAX_ALLOW_C is this invocation's: a relax the program starts does not inherit it
@@ -1047,7 +1076,7 @@ mod tests {
         assert_eq!(get(&again, "RELAX_ALLOW_C"), Some(&b"1"[..]), "a self-exec child, this run again, keeps --allow-c");
 
         let plain = child_env(&real, &[], &Spawn { edits: &[], clear: false, self_exec: true, dir: ChildDir::Same, host: &[] });
-        assert_eq!(get(&plain, "RELAX_PROGRAM_ENV"), None, "a self-exec child of a program with no values of its own gets no PROGRAM_ENV");
+        assert_eq!(program_env(&plain), vec![(SELF_EXEC_CHILD.to_vec(), None)], "the only overlay in a plain self-exec child hides the native execution host fact");
 
         let foreign = child_env(&real, &own, &Spawn { self_exec: false, ..spawn });
         assert_eq!(get(&foreign, "RELAX_BOOT_TRACE"), Some(&b"1"[..]), "a foreign child gets the Command's values as plain variables");
@@ -1237,5 +1266,30 @@ mod tests {
         assert!(!scratch.exists(), "the child's host wrote nothing into the cache folder the program gave its child");
         assert_eq!(String::from_utf8_lossy(&sh.stdout).trim(), "set by the parent|none|none",
             "a foreign child gets the program's values as plain variables, no PROGRAM_ENV and no run fact");
+    }
+    #[test]
+    fn native_self_exec_mode_is_host_only_and_does_not_follow_other_children() {
+        for clear in [false, true] {
+            let child = child_env(&[], &[], &Spawn { edits: &[], clear, self_exec: true, dir: ChildDir::Same, host: &[] });
+            assert!(child.iter().any(|(name, value)| same_name(name, SELF_EXEC_CHILD) && value == b"1"));
+            let overlay = child.iter().find(|(name, _)| same_name(name, PROGRAM_ENV)).expect("the private host fact needs an overlay");
+            assert!(parse(&overlay.1).unwrap().iter().any(|(name, value)| same_name(name, SELF_EXEC_CHILD) && value.is_none()));
+            let other = child_env(&child, &[], &Spawn { edits: &[], clear, self_exec: false, dir: ChildDir::Same, host: &[] });
+            assert!(!other.iter().any(|(name, _)| same_name(name, SELF_EXEC_CHILD)));
+        }
+    }
+    #[test]
+    fn shell_self_exec_preserves_the_programs_pre_marker_view() {
+        for value in [None, Some(b"owned-value".to_vec())] {
+            let real = value.as_ref().map(|v| vec![(SELF_EXEC_CHILD.to_vec(), v.clone())]).unwrap_or_default();
+            let handover = self_exec_handover(&real).unwrap();
+            assert!(handover.iter().any(|(name, v)| same_name(name, SELF_EXEC_CHILD) && v == b"1"));
+            let overlay = handover.iter().find(|(name, _)| same_name(name, PROGRAM_ENV)).unwrap();
+            assert_eq!(parse(&overlay.1).unwrap(), vec![(SELF_EXEC_CHILD.to_vec(), value)]);
+        }
+        let real = vec![(SELF_EXEC_CHILD.to_vec(), b"1".to_vec()), (PROGRAM_ENV.to_vec(), encode(&[(SELF_EXEC_CHILD.to_vec(), None)]))];
+        let handover = self_exec_handover(&real).unwrap();
+        let overlay = handover.iter().find(|(name, _)| same_name(name, PROGRAM_ENV)).unwrap();
+        assert_eq!(parse(&overlay.1).unwrap(), vec![(SELF_EXEC_CHILD.to_vec(), None)]);
     }
 }

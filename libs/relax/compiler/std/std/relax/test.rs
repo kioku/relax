@@ -469,7 +469,14 @@ fn run(t: &mut Tests, opts: &Opts, descs: Arc<Vec<Desc>>, filtered_out: usize) -
     let _ = crate::io::stdout().flush();
     // a filter that ran no test is no pass (makepad_remote::hot::NO_TESTS_EXIT); under
     // `makepad test` (TEST_PACKAGE_ENV) it says so once for all its targets
-    if ok && passed == 0 && !opts.filters.is_empty() {
+    // A current_exe() child is a native-style test executable, not a new CLI
+    // test selection. Native libtest succeeds with an empty filtered set. Keep
+    // the direct user command's no-tests exit protocol unchanged.
+    #[cfg(any(unix, windows))]
+    let native_child = crate::env::host_var_os("RELAX_SELF_EXEC_CHILD").is_some_and(|value| value == "1");
+    #[cfg(not(any(unix, windows)))]
+    let native_child = false;
+    if ok && passed == 0 && !opts.filters.is_empty() && !native_child {
         if crate::env::var("RELAX_TEST_PACKAGE").is_err() {
             eprintln!("error: no test matched {}{}", opts.filters.join(" "), if ignored > 0 { format!(" ({} matched and ignored: --ignored runs them)", ignored) } else { String::new() });
         }
