@@ -85,6 +85,25 @@ pub struct TimevalC {
     pub tv_usec: i64, // macOS suseconds_t is i32 + padding; the low word is what counts
 }
 
+/// sendmsg's msghdr. Darwin uses 32-bit counts; Linux/Android use size_t.
+#[repr(C)]
+pub struct MsgHdr {
+    pub msg_name: *mut c_void,
+    pub msg_namelen: socklen_t,
+    // IoSlice has the platform iovec layout.
+    pub msg_iov: *const c_void,
+    #[cfg(target_vendor = "apple")]
+    pub msg_iovlen: c_int,
+    #[cfg(not(target_vendor = "apple"))]
+    pub msg_iovlen: usize,
+    pub msg_control: *mut c_void,
+    #[cfg(target_vendor = "apple")]
+    pub msg_controllen: socklen_t,
+    #[cfg(not(target_vendor = "apple"))]
+    pub msg_controllen: usize,
+    pub msg_flags: c_int,
+}
+
 #[repr(C)]
 pub struct PollFd {
     pub fd: c_int,
@@ -136,6 +155,7 @@ extern "C" {
     pub fn getpeername(fd: c_int, addr: *mut u8, len: *mut socklen_t) -> c_int;
     pub fn shutdown(fd: c_int, how: c_int) -> c_int;
     pub fn send(fd: c_int, buf: *const c_void, len: usize, flags: c_int) -> isize;
+    pub fn sendmsg(fd: c_int, msg: *const MsgHdr, flags: c_int) -> isize;
     pub fn sendto(fd: c_int, buf: *const c_void, len: usize, flags: c_int, addr: *const u8, addrlen: socklen_t) -> isize;
     pub fn recvfrom(fd: c_int, buf: *mut c_void, len: usize, flags: c_int, addr: *mut u8, addrlen: *mut socklen_t) -> isize;
     pub fn recv(fd: c_int, buf: *mut c_void, len: usize, flags: c_int) -> isize;

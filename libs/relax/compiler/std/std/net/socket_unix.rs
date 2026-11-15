@@ -92,6 +92,21 @@ impl Socket {
             Ok(r as usize)
         }
     }
+    pub(crate) fn write_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut msg: sn::MsgHdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = bufs.as_ptr() as *const c_void;
+        // IOV_MAX is 1024 on Linux, Android and Darwin. Like std, submit a
+        // prefix rather than reject a larger slice; the caller handles partial writes.
+        msg.msg_iovlen = bufs.len().min(1024) as _;
+        // Preserve write's SIGPIPE suppression while submitting all buffers in
+        // one syscall, rather than the Write default's first non-empty buffer.
+        let r = unsafe { sn::sendmsg(self.raw(), &msg, sn::MSG_NOSIGNAL) };
+        if r < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(r as usize)
+        }
+    }
     pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         let h = match how {
             Shutdown::Read => sn::SHUT_RD,
