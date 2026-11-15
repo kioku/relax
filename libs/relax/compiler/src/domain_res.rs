@@ -113,6 +113,15 @@ static OWNED: Mutex<Vec<Owned>> = Mutex::new(Vec::new());
 type ForkFn = Option<unsafe extern "C" fn()>;
 #[cfg(unix)]
 static ATFORK: Mutex<Vec<(u64, ForkFn, ForkFn, ForkFn)>> = Mutex::new(Vec::new());
+// A conservative marker: an exec child must not lock the possibly inherited registry.
+// Never clear it, even when a domain's handlers are removed.
+#[cfg(unix)]
+static ATFORK_REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+pub(crate) fn atfork_may_have_handlers() -> bool {
+    ATFORK_REGISTERED.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 #[cfg(unix)]
 use unix::Res;
@@ -531,6 +540,8 @@ mod unix {
     /// The program's `pthread_atfork`, kept here (`ATFORK`): libc would call the handlers after the
     /// run's end, and on threads not in its domain.
     pub extern "C" fn pthread_atfork(prepare: ForkFn, parent: ForkFn, child: ForkFn) -> c_int {
+        // Mark before taking the lock: a fork during registration must not assume it is unused.
+        ATFORK_REGISTERED.store(true, std::sync::atomic::Ordering::SeqCst);
         let domain = crate::domain::current();
         let _kept = crate::zone_alloc::kept();
         ATFORK.lock().unwrap_or_else(|e| e.into_inner()).push((domain, prepare, parent, child));

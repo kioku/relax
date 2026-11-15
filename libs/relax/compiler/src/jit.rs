@@ -2149,6 +2149,11 @@ fn optimize_tree_panicked(up: *mut Unit, id: u32, p: Box<dyn std::any::Any + Sen
 /// app not yet running hung at 'compiling: build scripts' on a cold cache).
 #[cfg(unix)]
 extern "C" fn relax_fork() -> i32 {
+    // An exec child has no compiler workers to pause. With no program handlers to run,
+    // fork directly; its child inherits exec_child and cannot enter the compiler either.
+    if crate::forkexec::exec_child() && !crate::domain_res::atfork_may_have_handlers() {
+        return os::thread::fork();
+    }
     let handlers = crate::domain_res::atfork_prepare();
     fork_prepare();
     let pid = os::thread::fork();
