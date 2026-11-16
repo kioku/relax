@@ -587,14 +587,16 @@ impl Resolver {
     }
 
     /// The registry version the requesting package's Cargo.lock edge names, if unambiguous and
-    /// accepted by the requirement. Missing or ambiguous edges leave requirement-based resolution.
-    fn locked_edge(&self, from: (&str, &str), dep: &str, req: &str) -> Option<String> {
-        let mut parents = self.ws.lock_by_name.get(from.0)?.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| p.version == from.1);
-        let parent = parents.next()?;
+    /// accepted by the requirement. Absent or ambiguous edges leave requirement-based resolution,
+    /// but an explicit registry edge whose target is missing must not pick another version.
+    fn locked_edge(&self, from: (&str, &str), dep: &str, req: &str) -> Result<Option<String>, String> {
+        let Some(indices) = self.ws.lock_by_name.get(from.0) else { return Ok(None) };
+        let mut parents = indices.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| p.version == from.1);
+        let Some(parent) = parents.next() else { return Ok(None) };
         if parents.next().is_some() {
-            return None;
+            return Ok(None);
         }
-        let targets = self.ws.lock_by_name.get(dep)?;
+        let targets = self.ws.lock_by_name.get(dep).map(Vec::as_slice).unwrap_or(&[]);
         let mut versions = BTreeSet::new();
         for edge in &parent.deps {
             let (id, source) = match edge.split_once(" (") {
@@ -609,7 +611,7 @@ impl Resolver {
                 continue;
             }
             let version = parts.next();
-            if parts.next().is_some() {
+            if parts.next().is_some() || source.is_some_and(|s| !s.starts_with("registry+")) {
                 continue;
             }
             let mut named = targets.iter().map(|&i| &self.ws.lock_pkgs[i]).filter(|p| {
@@ -617,7 +619,18 @@ impl Resolver {
                     && (version.is_none() || version == Some(p.version.as_str()))
                     && (source.is_none() || source == p.source.as_deref())
             });
-            let Some(pkg) = named.next() else { continue };
+            let Some(pkg) = named.next() else {
+                // Unqualified versioned edges can name a path or git package too. An
+                // existing nonregistry target is unrelated to this registry lookup.
+                let target_exists = targets.iter().map(|&i| &self.ws.lock_pkgs[i]).any(|p| {
+                    (version.is_none() || version == Some(p.version.as_str()))
+                        && (source.is_none() || source == p.source.as_deref())
+                });
+                if version.is_some() && !target_exists {
+                    return Err(format!("Cargo.lock edge `{edge}` of `{} {}` names a missing registry package", parent.name, parent.version));
+                }
+                continue;
+            };
             if named.next().is_some() {
                 continue;
             }
@@ -625,11 +638,11 @@ impl Resolver {
                 versions.insert(pkg.version.as_str());
             }
         }
-        if versions.len() == 1 { versions.into_iter().next().map(str::to_string) } else { None }
+        Ok(if versions.len() == 1 { versions.into_iter().next().map(str::to_string) } else { None })
     }
 
     fn registry_dir(&self, name: &str, req: &str, from: Option<(&str, &str)>) -> Result<String, String> {
-        let exact = from.and_then(|from| self.locked_edge(from, name, req));
+        let exact = from.map(|from| self.locked_edge(from, name, req)).transpose()?.flatten();
         match &self.vendor {
             Some((Vendor::Dir(vdir), config)) => return self.vendored_dir(vdir, config, name, req, exact.as_deref()),
             // the repository's package of that name (cargo's discovery, as for a git dependency)
@@ -3666,6 +3679,49 @@ required-features = ["b", "manual"]
         r.registry_src = format!("{root}/cache");
         assert_eq!(r.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).unwrap(), format!("{root}/cache/index.test-0/dep-1.0.0"), "a bare dependency name must resolve to its only locked registry package");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An explicit edge cannot be replaced by another locked or vendored version when its
+    /// target package entry is missing. An absent edge still permits requirement resolution.
+    #[test]
+    fn a_missing_lock_edge_target_does_not_fall_back() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let source = "registry+https://github.com/rust-lang/crates.io-index";
+        let package = "[package]\nname = \"dep\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+        let root = tree("missing-lock-target", &[
+            ("Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep = \">=1, <3\"\n"),
+            ("src/lib.rs", ""),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("vendor/dep-1.0.0/Cargo.toml", package),
+            ("vendor/dep-1.0.0/src/lib.rs", ""),
+            ("vendor/dep-1.0.0/.cargo-checksum.json", "{\"files\":{},\"package\":null}"),
+            ("cache/local/dep-1.0.0/Cargo.toml", package),
+            ("cache/local/dep-1.0.0/src/lib.rs", ""),
+        ]);
+        for other_locked in [false, true] {
+            for edge in ["dep 2.0.0".to_string(), format!("dep 2.0.0 ({source})")] {
+                let other = if other_locked { format!("[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n") } else { String::new() };
+                std::fs::write(format!("{root}/Cargo.lock"), format!("version = 3\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"{edge}\"]\n{other}")).unwrap();
+                let mut resolver = Resolver::new(sess, &root).unwrap();
+                let error = resolver.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).expect_err("a missing edge target must not select the vendored fallback");
+                assert!(error.contains("missing registry package") && error.contains(&edge), "{error}");
+                resolver.vendor = None;
+                resolver.registry_src = format!("{root}/cache");
+                let error = resolver.registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).expect_err("a missing edge target must not select a cached fallback");
+                assert!(error.contains("missing registry package") && error.contains(&edge), "{error}");
+            }
+        }
+        std::fs::write(format!("{root}/Cargo.lock"), format!("version = 3\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n")).unwrap();
+        assert!(Resolver::new(sess, &root).unwrap().registry_dir("dep", ">=1, <3", Some(("app", "0.1.0"))).is_ok(), "an absent edge still uses requirement resolution");
+        for nonregistry_source in [String::new(), "source = \"git+https://example.invalid/dep#0123456789012345678901234567890123456789\"\n".to_string()] {
+            std::fs::write(format!("{root}/Cargo.lock"), format!("version = 3\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"dep 1.0.0\", \"dep 2.0.0\"]\n[[package]]\nname = \"dep\"\nversion = \"1.0.0\"\nsource = \"{source}\"\n[[package]]\nname = \"dep\"\nversion = \"2.0.0\"\n{nonregistry_source}")).unwrap();
+            let mut resolver = Resolver::new(sess, &root).unwrap();
+            assert!(resolver.registry_dir("dep", "1", Some(("app", "0.1.0"))).is_ok(), "an existing path or git target must not invalidate a registry sibling");
+            resolver.vendor = None;
+            resolver.registry_src = format!("{root}/cache");
+            assert!(resolver.registry_dir("dep", "1", Some(("app", "0.1.0"))).is_ok(), "mixed-source cache resolution must keep the registry edge");
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// A path dependency a third-party manifest names is third-party too. A vendored registry
