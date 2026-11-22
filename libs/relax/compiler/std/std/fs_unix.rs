@@ -1144,10 +1144,19 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     }
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-    opts.set_mode(meta.permissions().mode_bits());
+    // A store executable is read-only. Create its copy owner-writable so Linux
+    // permits writing the origin xattr, then restore the source permissions.
+    // Do not grant any group/other write permissions beyond the source mode.
+    opts.set_mode(meta.permissions().mode_bits() | 0o200);
     let mut writer = opts.open(to.as_ref())?;
-    writer.set_permissions(meta.permissions())?;
-    io::copy(&mut reader, &mut writer)
+    writer.set_permissions(Permissions { mode: meta.permissions().mode_bits() | 0o200 })?;
+    let copied = io::copy(&mut reader, &mut writer)?;
+    // No program environment is written into the copied file.
+    extern "C" { fn __relax_executable_copied(from: i32, to: i32); }
+    unsafe { __relax_executable_copied(reader.as_raw_fd(), writer.as_raw_fd()) };
+    // Never restore special bits after writing, and leave a failed copy narrowed.
+    writer.set_permissions(Permissions { mode: meta.permissions().mode_bits() & 0o777 })?;
+    Ok(copied)
 }
 
 pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {

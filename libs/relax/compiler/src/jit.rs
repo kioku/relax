@@ -27548,6 +27548,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_env_snapshot" => Some(relax_base::progenv::env_snapshot as *const () as usize),
         b"__relax_spawn_env" => Some(relax_base::progenv::spawn_env as *const () as usize),
         b"__relax_prepared_bin" => Some(relax_base::progenv::prepared_bin as *const () as usize),
+        b"__relax_executable_copied" => Some(crate::selfexe::executable_copied as *const () as usize),
         // a build script's `$RUSTC` questions, answered in this process (tool.rs)
         b"__relax_tool_spawn" => Some(crate::tool::relax_tool_spawn as *const () as usize),
         b"__relax_tool_wait" => Some(crate::tool::relax_tool_wait as *const () as usize),

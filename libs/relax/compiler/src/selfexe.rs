@@ -28,7 +28,8 @@
 //! through its CARGO_BIN_EXE_<name> wrapper takes its test's run's build environment the same way
 //! (`prepared_build`, relax issue 205). The environment is never in a file: it holds the person's
 //! tokens, and a run that is killed leaves its entry. On Unix the run keeps it in a file that has
-//! no name, by a descriptor an exec keeps, and the entry says which (`hand_build`); on Windows it
+//! no name; on Linux the run keeps a sealed, close-on-exec descriptor read by intended children
+//! through /proc. Other Unix targets retain the legacy descriptor handoff. On Windows it
 //! is `+run/<pid>.build`, which goes with the run's last handle.
 //!
 //! A test's links are laid out as cargo lays out target/<profile>: its executable in a `deps/`
@@ -49,6 +50,9 @@
 //! run of that program registers.
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+mod copies;
+pub(crate) use copies::note as executable_copied;
 
 /// The folder of this run's links: its executable's (`run/`), or a test's above its `deps/`
 /// (`t-<key>`), where the package's binaries go (`add_bins`)
@@ -433,20 +437,54 @@ pub(crate) unsafe fn reset_statics() {
 
 #[cfg(unix)]
 extern "C" {
+    #[cfg(not(target_os = "linux"))]
     fn dup(fd: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    #[cfg(target_os = "linux")]
+    fn memfd_create(name: *const std::ffi::c_char, flags: u32) -> i32;
     fn getppid() -> i32;
 }
 
-/// The build environment (progenv `build_wire`, the person's whole environment as the run started,
-/// tokens included) goes to a launch of the link in a file without a name: made in the owner-only
-/// folder and unlinked before anything is written to it, held open by a descriptor without
-/// close-on-exec, which a shell's or a C library's exec of the link keeps. The run's entry
-/// (`entry`) names that descriptor by the words returned: its number and the file's device and
-/// inode, never a variable. When the run ends, killed or not, the file goes with its last
-/// descriptor, so no run leaves the environment on disk. A run that starts again in place (an exec
-/// of this process) closes the one its image before held.
-#[cfg(unix)]
+// Linux seals the anonymous record before publishing it. No descriptor is ever made
+// inheritable; the selected child reads a reference while the originating run is alive.
+#[cfg(target_os = "linux")]
+fn hand_build(_runs: &Path, _entry: &Path) -> std::io::Result<String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let kept = sealed_build(&crate::progenv::build_wire())?;
+    let m = kept.metadata()?;
+    let words = format!("{} {} {}", kept.as_raw_fd(), m.dev(), m.ino());
+    *HANDED.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+    crate::progenv::set_build_handle(Some(format!("{} {words}", std::process::id())));
+    Ok(words)
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_build(bytes: &[u8]) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    const MFD_CLOEXEC: u32 = 1;
+    const MFD_ALLOW_SEALING: u32 = 2;
+    const F_ADD_SEALS: i32 = 1033;
+    let fd = unsafe { memfd_create(c"relax-build".as_ptr(), MFD_CLOEXEC | MFD_ALLOW_SEALING) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
+    writer.write_all(bytes)?;
+    if unsafe { fcntl(fd, F_ADD_SEALS, BUILD_SEALS) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // The writer closes when this returns; only the read-only descriptor survives.
+    std::fs::File::open(format!("/proc/self/fd/{fd}"))
+}
+
+// F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE.
+#[cfg(target_os = "linux")]
+const BUILD_SEALS: i32 = 0x0f;
+
+/// Legacy anonymous descriptor transport on Unix targets without Linux /proc and seals.
+#[cfg(all(unix, not(target_os = "linux")))]
 fn hand_build(runs: &Path, entry: &Path) -> std::io::Result<String> {
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -492,7 +530,7 @@ fn hand_build(runs: &Path, _entry: &Path) -> std::io::Result<String> {
 }
 
 /// Descriptor `fd` of this process when it is open on the file `dev`/`ino`, to own (and close).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn open_handed(fd: i32, dev: u64, ino: u64) -> Option<std::fs::File> {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::MetadataExt;
@@ -506,7 +544,7 @@ fn open_handed(fd: i32, dev: u64, ino: u64) -> Option<std::fs::File> {
 }
 
 /// Whether this process holds descriptor `fd` open on the file `dev`/`ino` (left open).
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn holds(fd: i32, dev: u64, ino: u64) -> bool {
     use std::os::fd::IntoRawFd;
     open_handed(fd, dev, ino).map(IntoRawFd::into_raw_fd).is_some()
@@ -579,15 +617,31 @@ fn read_handed(at: &[(u32, i32, u64, u64)], parent: u32) -> Option<Vec<u8>> {
         f.read_exact_at(&mut b, 0).ok()?;
         Some(b)
     };
+    #[cfg(not(target_os = "linux"))]
     if let Some(f) = at.iter().find_map(|&(_, fd, dev, ino)| open_handed(fd, dev, ino)) {
         return read(&f);
     }
     #[cfg(target_os = "linux")]
-    for &(pid, fd, dev, ino) in at.iter().filter(|h| h.0 == parent) {
-        if let Ok(f) = std::fs::File::open(format!("/proc/{pid}/fd/{fd}")) {
-            use std::os::unix::fs::MetadataExt;
-            if f.metadata().is_ok_and(|m| m.dev() == dev && m.ino() == ino) {
-                return read(&f);
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        const F_GET_SEALS: i32 = 1034;
+        const O_NONBLOCK: i32 = 0o4000;
+        // Never read an unrelated process's descriptor. Walk nearest ancestors first,
+        // including when an intervening launcher cleared the environment.
+        for ancestor in lineage().into_iter().skip(1) {
+            for &(pid, fd, dev, ino) in at.iter().filter(|h| h.0 == ancestor) {
+                let path = format!("/proc/{pid}/fd/{fd}");
+                if !std::fs::read_link(&path).ok().is_some_and(|p| p.as_os_str() == "/memfd:relax-build (deleted)") {
+                    continue;
+                }
+                let Ok(f) = std::fs::OpenOptions::new().read(true).custom_flags(O_NONBLOCK).open(path) else { continue };
+                let seals = unsafe { fcntl(f.as_raw_fd(), F_GET_SEALS) };
+                if seals >= 0 && seals & BUILD_SEALS == BUILD_SEALS && f.metadata().is_ok_and(|m| {
+                    m.is_file() && m.dev() == dev && m.ino() == ino && m.len() <= 128 * 1024
+                }) {
+                    return read(&f);
+                }
             }
         }
     }
@@ -704,7 +758,7 @@ pub fn add_bins(launchers: &[String]) -> Vec<PathBuf> {
 /// binary runs that binary), so the loader running from one spawns itself by RELAX_LOADER
 /// (dirs::loader_exe).
 pub fn is_link(exe: &Path) -> bool {
-    crate::dirs::is_run_link(exe)
+    crate::dirs::is_run_link(exe) || copied_run(exe).is_some()
 }
 
 /// A start of a package binary above a test's `deps/` (Windows, `add_bins`): `args` with the
@@ -738,16 +792,20 @@ pub fn bin_start(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
 /// it, with the program's arguments alone.)
 pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    if dir.file_name().is_some_and(|n| n == LAUNCH) {
-        return None;
-    }
-    let runs = runs_in(dir)?;
+    let (dir, candidates, is_copy) = if let Some((dir, run)) = copied_run(&exe) {
+        (dir, vec![run], true)
+    } else {
+        let dir = exe.parent()?;
+        if dir.file_name().is_some_and(|n| n == LAUNCH) {
+            return None;
+        }
+        (dir.to_path_buf(), runs_in(dir)?, false)
+    };
     let rest = args.get(1..).unwrap_or_default();
-    if runs.iter().any(|r| starts_with_line(rest, &r.line)) {
+    if candidates.iter().any(|r| starts_with_line(rest, &r.line)) {
         return None;
     }
-    let run = match which_run(&runs) {
+    let run = match which_run(&candidates) {
         Ok(r) => r,
         Err(why) => {
             eprintln!("relax: {}: {why}", exe.display());
@@ -755,11 +813,55 @@ pub fn relaunched(args: &[Vec<u8>]) -> Option<Vec<Vec<u8>>> {
         }
     };
     let _ = RELAUNCH.set((run.pid, run.handed, silent_words(&run.line)));
+    if is_copy {
+        // The copied file is an application executable, not a new loader. Keep
+        // later compiler/native spawns on the loader recorded by its live run.
+        if let Some(loader) = crate::dirs::recorded_loader(&dir.join(exe.file_name()?)) {
+            unsafe { std::env::set_var("RELAX_LOADER", loader) };
+        }
+    }
     let mut out = run.line.clone();
     out[0] = args.first()?.clone();
     out.extend(rest.iter().cloned());
     Some(out)
 }
+
+/// Return the nearest live ancestor's run only after checking the origin's ownership and mode.
+fn copied_run(exe: &Path) -> Option<(PathBuf, Run)> {
+    let dir = copies::origin(exe)?;
+    if !private_copy_origin(&dir) {
+        return None;
+    }
+    let mut runs = runs_in(&dir)?;
+    for pid in lineage().into_iter().skip(1) {
+        if let Some(index) = runs.iter().position(|run| run.pid == pid && alive(pid)) {
+            return Some((dir, runs.swap_remove(index)));
+        }
+    }
+    None
+}
+
+/// Read +loader beside the validated original, never beside the byte copy.
+pub fn recorded_loader(exe: &Path) -> Option<PathBuf> {
+    match copied_run(exe) {
+        Some((origin, _)) => crate::dirs::recorded_loader(&origin.join(exe.file_name()?)),
+        None if crate::dirs::is_run_link(exe) => crate::dirs::recorded_loader(exe),
+        None => None,
+    }
+}
+
+#[cfg(unix)]
+fn private_copy_origin(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    extern "C" { fn geteuid() -> u32; }
+    let uid = unsafe { geteuid() };
+    [dir.to_path_buf(), dir.join(RUNS)].iter().all(|p| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() == uid && m.mode() & 0o077 == 0)
+    })
+}
+
+#[cfg(not(unix))]
+fn private_copy_origin(_dir: &Path) -> bool { false }
 
 /// Whether `rest` (the arguments after argv[0]) start with a run's `line` after its first word, or
 /// with that line without the `--silent` a run adds at its index 2 (which an exec drops).
@@ -781,7 +883,7 @@ fn which_run(runs: &[Run]) -> Result<&Run, String> {
         lineage.iter().find_map(|&a| of.iter().find(|r| r.pid == a).copied())
     }
     let lineage = lineage();
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let held: Vec<&Run> = runs.iter().filter(|r| r.handed.is_some_and(|(fd, dev, ino)| holds(fd, dev, ino))).collect();
         if let Some(r) = nearest(&lineage, &held).or(held.first().copied()) {
@@ -933,6 +1035,24 @@ pub fn parent_of(_pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_build_record_is_read_only_sealed_and_close_on_exec() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        let mut record = sealed_build(b"synthetic build settings").unwrap();
+        let fd = record.as_raw_fd();
+        let fd_flags = unsafe { fcntl(fd, 1) };
+        assert!(fd_flags >= 0 && fd_flags & 1 == 1, "FD_CLOEXEC");
+        assert_eq!(unsafe { fcntl(fd, 3) } & 3, 0, "O_RDONLY");
+        let seals = unsafe { fcntl(fd, 1034) };
+        assert!(seals >= 0 && seals & BUILD_SEALS == BUILD_SEALS);
+        assert!(std::fs::OpenOptions::new().write(true).open(format!("/proc/self/fd/{fd}")).unwrap().write_all(b"change").is_err());
+        let mut bytes = Vec::new();
+        record.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"synthetic build settings");
+    }
 
     /// What the links of a loader are told by: a hard link and its file are one file, with one
     /// key; a copy is another file; the file a new build put at the loader's path has another key

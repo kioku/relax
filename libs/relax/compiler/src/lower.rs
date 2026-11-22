@@ -15624,8 +15624,9 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
     // rustc's eligibility (coroutine_saved_local_eligibility): a slot saved at one suspension
     // point only goes to that point's variant, unless its storage is live together with a slot
     // of another variant (then the one with more such conflicts is promoted); slots saved at
-    // several points are promoted. An awaited future never conflicts: it is live only around
-    // its own point.
+    // several points are promoted. Awaited futures participate too: their storage is live
+    // from construction through the Ready-path drop, not just at their suspension point.
+    // A value saved at another point can still be live during that interval.
     let nk = c.suspends.len();
     let mut variant_of: Vec<Option<usize>> = vec![None; ns];
     for s in 0..ns {
@@ -15633,7 +15634,7 @@ fn coroutine_transform(f: &mut Func, c: &Coro, ptr_bytes: u32, tys: &(std::colle
             variant_of[s] = Some(saved_at[s][0]);
         }
     }
-    let cand: Vec<usize> = (0..ns).filter(|&s| variant_of[s].is_some() && await_slot[s].is_none()).collect();
+    let cand: Vec<usize> = (0..ns).filter(|&s| variant_of[s].is_some()).collect();
     if cand.len() > 1 {
         let mut vsucc: Vec<Vec<u32>> = f.blocks.iter().map(|b| b.term.succs().into_iter().collect()).collect();
         for &(pend, resume, cancel) in &c.suspends {

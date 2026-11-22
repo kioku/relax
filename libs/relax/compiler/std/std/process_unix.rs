@@ -456,7 +456,7 @@ impl Command {
     /// under `makepad run` a run of this program again (`self_exec`) gets the host's settings for
     /// its host and the program's own values apart; any other child the program's view. `dir`: where
     /// the child runs; `host`: this std's plumbing values for the child's host.
-    fn envp(&self, self_exec: bool, dir: &ChildDir, host: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
+    fn envp(&self, self_exec: bool, exec: bool, dir: &ChildDir, host: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
         let mut edits: Vec<u8> = Vec::new();
         for (k, v) in &self.env {
             wire_push(&mut edits, k.as_encoded_bytes(), v.as_ref().map(|v| v.as_encoded_bytes()));
@@ -465,7 +465,7 @@ impl Command {
         for (k, v) in host {
             wire_push(&mut plumbing, k.as_encoded_bytes(), Some(v.as_encoded_bytes()));
         }
-        let mut flags: u32 = 0;
+        let mut flags: u32 = if exec { 32 } else { 0 };
         if self.env_clear {
             flags |= 1;
         }
@@ -660,7 +660,7 @@ impl Command {
             argv.push(a.as_ptr());
         }
         argv.push(core::ptr::null());
-        let envp_c = self.envp(self_exec.is_some(), dir, &host)?;
+        let envp_c = self.envp(self_exec.is_some(), exec, dir, &host)?;
         let mut envp: Vec<*const c_char> = Vec::new();
         for e in &envp_c {
             envp.push(e.as_ptr());

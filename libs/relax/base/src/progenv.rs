@@ -906,9 +906,40 @@ pub fn given_wire() -> Vec<u8> {
 /// This run's build environment in the wire form (`encode`): what a run of its program again
 /// builds with (`spawn_env`, and selfexe.rs `hand_build` for a launch of its link by a shell).
 pub fn build_wire() -> Vec<u8> {
-    let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter()
+        .filter(|(k, v)| !cfg!(target_os = "linux") || build_handoff_setting(k, v))
+        .map(|(k, v)| (k, Some(v))).collect();
     encode(&build)
 }
+// Explicit allowlist: build settings, not the caller's general environment or credentials.
+fn build_handoff_setting(name: &[u8], value: &[u8]) -> bool {
+    match name {
+        b"HTTP_PROXY" | b"HTTPS_PROXY" | b"ALL_PROXY" | b"http_proxy" | b"https_proxy" | b"all_proxy" => {
+            // Only a bare proxy authority, never userinfo, path, query or fragment.
+            let authority = [b"http://".as_slice(), b"https://", b"socks5://", b"socks5h://"]
+                .iter().find_map(|prefix| value.strip_prefix(*prefix)).unwrap_or(value);
+            return !authority.is_empty() && authority.iter().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b':' | b'[' | b']')
+            });
+        }
+        b"NO_PROXY" | b"no_proxy" => return value.iter().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(*b, b'.' | b'-' | b':' | b'[' | b']' | b',' | b'*' | b'/' | b' ')
+        }),
+        _ => {}
+    }
+
+    matches!(name, b"HOME" | b"PATH" | b"LANG" | b"LC_ALL" | b"TMPDIR"
+        | b"CARGO_HOME" | b"RUSTUP_HOME" | b"CARGO_TARGET_DIR"
+        | b"XDG_CACHE_HOME" | b"XDG_CONFIG_HOME" | b"XDG_DATA_HOME" | b"XDG_STATE_HOME"
+        | b"RELAX_HOME" | b"RELAX_STD" | b"RELAX_CACHE_DIR" | b"RELAX_FLIGHTREC" | b"RELAX_OFFLINE"
+        | b"CARGO_NET_OFFLINE" | b"CARGO_BUILD_TARGET" | b"CARGO_BUILD_JOBS"
+        | b"RUSTFLAGS" | b"RUSTDOCFLAGS" | b"CARGO_ENCODED_RUSTFLAGS"
+        | b"CC" | b"CXX" | b"AR" | b"CFLAGS" | b"CXXFLAGS" | b"CPPFLAGS" | b"LDFLAGS"
+        | b"PKG_CONFIG" | b"PKG_CONFIG_PATH" | b"PKG_CONFIG_LIBDIR" | b"PKG_CONFIG_SYSROOT_DIR"
+        | b"SSL_CERT_FILE" | b"SSL_CERT_DIR" | b"NIX_SSL_CERT_FILE"
+        | b"NIX_CFLAGS_COMPILE" | b"NIX_CFLAGS_LINK" | b"NIX_LDFLAGS")
+}
+
 /// The words a spawn of this run's program hands its build environment by (`BUILD_FD`), while
 /// relax-compiler selfexe.rs holds that descriptor (`hand_build`); None: none is held, and a spawn
 /// hands the environment itself (`BUILD_ENV`).
@@ -1009,7 +1040,7 @@ pub extern "C" fn prepared_bin(path: *const u8, len: usize) -> i32 {
 /// program's values), every entry set (`encode`), valid until this thread's next call. `edits` are
 /// the Command's, `host` std's plumbing values for the child's host, both in the wire form;
 /// `flags`: 1 env_clear, 2 self-exec, 4 a virtual folder (its WORKSPACE and VFS are in `host`),
-/// 8 a real folder, 16 a package binary this run prepared (`prepared_bin`).
+/// 8 a real folder, 16 a package binary this run prepared (`prepared_bin`), 32 in-place exec.
 pub extern "C" fn spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize) {
     let bytes = |p: *const u8, n: usize| if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(p, n) } };
     let edits = parse(bytes(edits, edits_len)).expect("a spawn's edits from Relax std");
@@ -1028,8 +1059,9 @@ pub extern "C" fn spawn_env(edits: *const u8, edits_len: usize, host: *const u8,
     // builds as this run does
     if flags & (2 | 16) != 0 {
         match BUILD_HANDLE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            Some(at) => host.push((BUILD_FD.to_vec(), at)),
-            None => host.push((BUILD_ENV.to_vec(), build_wire())),
+            Some(at) if !cfg!(target_os = "linux") || flags & 32 == 0 => host.push((BUILD_FD.to_vec(), at)),
+            // In-place Linux exec closes the descriptor and leaves no parent holding it.
+            _ => host.push((BUILD_ENV.to_vec(), build_wire())),
         }
     }
     let spawn = Spawn { edits: &edits, clear: flags & 1 != 0, self_exec: flags & 2 != 0, dir, host: &host };
@@ -1103,6 +1135,17 @@ mod tests {
             let child = child_env(&[], &forged, &Spawn { edits: &forged, clear: false, self_exec, dir: ChildDir::Same, host: &[] });
             assert!(!child.iter().any(|(k, v)| handed_build(k) || v.windows(13).any(|w| w == b"RELAX_ALLOW_C")), "a program's RELAX_BUILD_ENV or RELAX_BUILD_FD crossed to a child (self-exec {self_exec}): {child:?}");
         }
+    }
+
+    #[test]
+    fn build_handoff_keeps_only_noncredential_settings() {
+        assert!(build_handoff_setting(b"RELAX_OFFLINE", b"1"));
+        assert!(build_handoff_setting(b"CC", b"cc"));
+        assert!(build_handoff_setting(b"https_proxy", b"https://proxy.example:443"));
+        assert!(!build_handoff_setting(b"HTTPS_PROXY", b"https://user:secret@proxy.example"));
+        assert!(!build_handoff_setting(b"HTTPS_PROXY", b"https://proxy.example/secret"));
+        assert!(!build_handoff_setting(b"CARGO_REGISTRIES_CRATES_IO_TOKEN", b"fixture"));
+        assert!(!build_handoff_setting(b"AWS_SECRET_ACCESS_KEY", b"fixture"));
     }
 
     #[test]

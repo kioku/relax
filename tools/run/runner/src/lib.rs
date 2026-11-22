@@ -180,7 +180,7 @@ pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
             }
         }
         if link {
-            return relax_compiler::dirs::recorded_loader(&exe);
+            return relax_compiler::selfexe::recorded_loader(&exe);
         }
         Some(exe)
     })
