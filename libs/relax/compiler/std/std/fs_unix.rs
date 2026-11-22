@@ -1146,10 +1146,10 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     opts.write(true).create(true).truncate(true);
     // A store executable is read-only. Create its copy owner-writable so Linux
     // permits writing the origin xattr, then restore the source permissions.
-    // Do not grant any group/other write permissions beyond the source mode.
-    opts.set_mode(meta.permissions().mode_bits() | 0o200);
+    // Stage with ordinary owner permissions only until the copy succeeds.
+    opts.set_mode(0o600);
     let mut writer = opts.open(to.as_ref())?;
-    writer.set_permissions(Permissions { mode: meta.permissions().mode_bits() | 0o200 })?;
+    writer.set_permissions(Permissions { mode: 0o600 })?;
     let copied = io::copy(&mut reader, &mut writer)?;
     // No program environment is written into the copied file.
     extern "C" { fn __relax_executable_copied(from: i32, to: i32); }

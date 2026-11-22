@@ -21,7 +21,7 @@ T=$(mktemp -d)
 [ -n "$T" ] && [ -d "$T" ] || exit 2
 trap 'rm -rf "$T"' EXIT
 # (a failing start ends its run: no panic parked for a decision)
-export RELAX_CACHE=off PREPARED_TOKEN=required CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=$T/target RELAX_PANIC_PARK=0
+export RELAX_CACHE=off LC_ALL=C CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=$T/target RELAX_PANIC_PARK=0
 export RELAX_STD=$H/../../std
 FAILS=0
 case_is() { # name ok?
@@ -48,7 +48,7 @@ echo "$OUT" | tail -3
 ok=0; no_native "$OUT" $rc && ok=1
 case_is "a named native build without --allow-c" $ok
 entry() { local e="$1=$2"; printf '%d:%s' "$(LC_ALL=C; echo ${#e})" "$e"; }
-HANDED=$(entry PATH "$PATH")$(entry HOME "${HOME-}")$(entry PREPARED_TOKEN required)$(entry CARGO_TARGET_DIR "$CARGO_TARGET_DIR")$(entry RELAX_ALLOW_C 1)
+HANDED=$(entry PATH "$PATH")$(entry HOME "${HOME-}")$(entry LC_ALL C)$(entry CARGO_TARGET_DIR "$CARGO_TARGET_DIR")$(entry RELAX_ALLOW_C 1)
 OUT=$(cd "$H" && RELAX_BUILD_ENV=$HANDED "$1" run --quiet pc-app 2>&1)
 rc=$?
 echo "$OUT" | tail -3

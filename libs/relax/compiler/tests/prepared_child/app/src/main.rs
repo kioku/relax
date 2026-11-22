@@ -1,8 +1,8 @@
 // `--empty`: started with a cleared environment, the program has none (its own reads, a list of
 // them, a shell's; `--via-shell`: but PATH, which the shell that started it may set).
-// `--token`: prints the PREPARED_TOKEN it was given. `--nested`: starts itself (current_exe) with
+// `--token`: prints the LC_ALL it was given. `--nested`: starts itself (current_exe) with
 // a cleared environment. `--shell-nested`: a shell it starts with a cleared environment execs it;
-// `--shell-changed`: a shell it starts with another PREPARED_TOKEN (the build script's input)
+// `--shell-changed`: a shell it starts with another LC_ALL (the build script's input)
 // execs it, which is still the run's build (relax issue 172, PR 175's shell case).
 // `--env-off-disk`: no file in the run's own folder (its executable's) holds PREPARED_MARKER's
 // value, which the run's build environment has: the run hands that to a launch of its executable
@@ -13,7 +13,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let has = |s: &str| args.iter().any(|a| a == s);
     if has("--empty") {
-        for name in ["HOME", "PATH", "PREPARED_TOKEN", "CARGO_HOME", "RUSTUP_HOME"] {
+        for name in ["HOME", "PATH", "LC_ALL", "CARGO_HOME", "RUSTUP_HOME"] {
             if name == "PATH" && has("--via-shell") {
                 continue;
             }
@@ -22,12 +22,12 @@ fn main() {
         }
         #[cfg(unix)]
         {
-            let out = Command::new("/bin/sh").args(["-c", "printf '%s:%s' \"${HOME-unset}\" \"${PREPARED_TOKEN-unset}\""]).output().unwrap();
+            let out = Command::new("/bin/sh").args(["-c", "printf '%s:%s' \"${HOME-unset}\" \"${LC_ALL-unset}\""]).output().unwrap();
             assert_eq!(String::from_utf8_lossy(&out.stdout), "unset:unset", "a shell the program starts has variables it was not given");
         }
     }
     if has("--token") {
-        println!("token {}", std::env::var("PREPARED_TOKEN").unwrap_or_default());
+        println!("token {}", std::env::var("LC_ALL").unwrap_or_default());
     }
     let built = format!("{} 5\n", env!("PREPARED_BUILD"));
     let exe = std::env::current_exe().unwrap();
@@ -65,9 +65,9 @@ fn main() {
             assert_eq!(String::from_utf8_lossy(&child.stdout), built);
         }
         if has("--shell-changed") {
-            let child = Command::new("/bin/sh").args(["-c", "exec \"$0\" --token"]).arg(&exe).env("PREPARED_TOKEN", "other").output().unwrap();
+            let child = Command::new("/bin/sh").args(["-c", "exec \"$0\" --token"]).arg(&exe).env("LC_ALL", "POSIX").output().unwrap();
             assert!(child.status.success(), "its own executable, exec'd by a shell with another build input: {}", String::from_utf8_lossy(&child.stderr));
-            assert_eq!(String::from_utf8_lossy(&child.stdout), format!("token other\n{built}"));
+            assert_eq!(String::from_utf8_lossy(&child.stdout), format!("token POSIX\n{built}"));
         }
     }
     println!("{} {}", env!("PREPARED_BUILD"), pc_native::add(2, 3));
