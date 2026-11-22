@@ -97,6 +97,8 @@ impl Tcx {
                 let trait_types = self.tys.list(*trait_types);
                 let raw_trait = self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&trait_types[..trait_types.len() - 1]), *trait_types.last().unwrap(), trait_sig.header, 0));
                 let trait_fn = ocx.normalize_ty(&env, raw_trait);
+                // The impl header is well-formed independently of what the signature normalizes to.
+                wf_tys.push(self.impl_self[&imp]);
                 for ty in [raw_trait, trait_fn] {
                     let TyKind::FnPtr(inputs, output, _, _) = self.tys.kind(ty) else { unreachable!() };
                     for &ty in self.tys.list(*inputs) { if !wf_tys.contains(&ty) { wf_tys.push(ty); } }
