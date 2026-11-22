@@ -185,8 +185,13 @@ pub fn current() -> u64 {
 
 /// Puts the calling thread in the domain whose block is `base`; returns the one it was in.
 pub fn enter(base: u64) -> u64 {
-    let slot = crate::jit::tls_block() as *mut u64;
     register_current(base);
+    select(base)
+}
+
+/// Selects the domain and heap without registering a thread (e.g. restoring a saved base).
+pub(crate) fn select(base: u64) -> u64 {
+    let slot = crate::jit::tls_block() as *mut u64;
     let heap = domains().iter().find(|d| d.info.base == base && base != 0)
         .and_then(|d| d.heap.as_deref()).map_or(std::ptr::null(), |h| h as *const _);
     unsafe {
@@ -348,11 +353,12 @@ pub extern "C" fn relax_domain_enter(base: u64, token: u64) {
     })
 }
 
-fn register_current(base: u64) {
-    if base == 0 { return; }
+// Returns only a token this call created, never one already owned by the caller.
+fn register_current(base: u64) -> u64 {
+    if base == 0 { return 0; }
     let _kept = crate::zone_alloc::kept();
     let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
-    if t.registrations.iter().any(|r| r.0 == base) { return; }
+    if t.registrations.iter().any(|r| r.0 == base) { return 0; }
     let token = relax_domain_reserve(base);
     if token != 0 {
         t.registrations.push((base, token));
@@ -364,6 +370,30 @@ fn register_current(base: u64) {
             }
         }
     }
+    token
+}
+
+/// A host thread executing a constant initializer is a program thread only for that call.
+/// Keep any enclosing registration; only retire the entry this call added.
+pub(crate) fn enter_initializer(base: u64, previous: u64) -> impl Drop {
+    struct Entry { base: u64, previous: u64, token: u64 }
+    impl Drop for Entry {
+        fn drop(&mut self) {
+            if current() != self.previous {
+                select(self.previous);
+            }
+            if self.token != 0 {
+                let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
+                t.registrations.retain(|r| *r != (self.base, self.token));
+                thread_finished(self.base, self.token);
+            }
+        }
+    }
+    let token = register_current(base);
+    if base != previous {
+        select(base);
+    }
+    Entry { base, previous, token }
 }
 
 static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -438,8 +468,8 @@ pub extern "C" fn relax_domain_name(name: *const u8) {
     })
 }
 
-/// Called after the TLS block and every Relax std TLS destructor are finished (also on a
-/// failed OS spawn, while the parent still holds its own registration).
+/// Retires a reservation after a program thread and its TLS destructors finish, after a failed
+/// OS spawn, or when a scoped initializer call returns to the host.
 pub extern "C" fn thread_finished(base: u64, token: u64) {
     crate::jit::host_boundary("thread_finished", move || {
         if token == 0 { return; }
@@ -1991,6 +2021,31 @@ mod tests {
     use super::*;
     use crate::jit::FnKey;
     use crate::program::DefId;
+
+    #[test]
+    fn initializer_thread_registration_is_scoped() {
+        isolated_test!(initializer_thread_registration_is_scoped);
+        // This only exercises the registry and TLS slot; no static storage is accessed.
+        let base = 0x1000;
+        register_boot("fixture", base);
+        let harness = crate::inspect::threads::self_os_id();
+        std::thread::spawn(move || {
+            let previous = current();
+            {
+                let _outer = enter_initializer(base, previous);
+                assert_eq!(threads_besides(base, harness).len(), 1);
+                drop(enter_initializer(base, base));
+                assert_eq!(threads_besides(base, harness).len(), 1);
+            }
+            assert_eq!(current(), previous);
+            assert!(threads_besides(base, harness).is_empty());
+
+            enter(base);
+            drop(enter_initializer(base, base));
+            assert_eq!(threads_besides(base, harness).len(), 1);
+        }).join().unwrap();
+        assert!(threads_besides(base, harness).is_empty());
+    }
 
     /// Two domains on the same compiled code: each has its own statics, a pointer inside a static
     /// image points into its own block, a static laid out after a domain exists is copied into it.
